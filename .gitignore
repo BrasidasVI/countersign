@@ -1,0 +1,10 @@
+# Dependencies / caches
+__pycache__/
+*.pyc
+
+# Device-local launcher config (paths differ per machine)
+device-config.sh
+device-config.sh.bak
+
+# Occasional local artifacts
+*.log
