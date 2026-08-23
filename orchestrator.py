@@ -14,6 +14,13 @@ has the claude CLI installed and logged in):
     must be launchable via subprocess (preflight proves it by actually launching it)
 
 Flow:
+  0. understanding confirmation: the drafter restates the task as a structured
+     understanding (type, intent, desired outcome, out-of-scope, repos, success
+     criteria); on an interactive terminal the human confirms y/n, clarifying
+     until confirmed. Non-interactive runs record the (unconfirmed) statement.
+     The confirmed understanding is a settled decision: it anchors the seed
+     prompt AND the review prompt (the reviewer checks plan fidelity to the
+     confirmed intent, not just internal soundness), and is skipped on resume.
   1. drafter (Claude Code) writes plan v1 from the seed idea          [read-only pass]
   2. reviewer (ZCode) reviews plan.md via --attach, read-only         [--mode plan],
      judged against REQUIRED INVARIANTS (see DEFAULT_REVIEW_RULES / --review-rules)
@@ -440,8 +447,9 @@ def build_review_prompt(plan_name: str, rules_text: str, settled: Optional[dict]
     return base
 
 
-def build_seed_prompt(idea: str, repo: Path) -> str:
-    return (
+def build_seed_prompt(idea: str, repo: Path, understanding: Optional[str] = None,
+                      confirmed: bool = False) -> str:
+    base = (
         "Produce a complete implementation plan document for the idea below. "
         f"The working repository is: {repo}\n"
         "\n"
@@ -460,6 +468,13 @@ def build_seed_prompt(idea: str, repo: Path) -> str:
         "note the decision inline.\n"
         "Output only the plan document (markdown), no surrounding commentary."
     )
+    if understanding:
+        label = ("HUMAN-CONFIRMED TASK UNDERSTANDING (authoritative; the plan must "
+                 "satisfy this exactly)" if confirmed else
+                 "DRAFTER'S UNCONFIRMED UNDERSTANDING (no terminal available to "
+                 "confirm it; plan against it but flag any doubts as open questions)")
+        base += ("\n=== " + label + " ===\n" + understanding + "\n=== END UNDERSTANDING ===\n")
+    return base
 
 
 def build_revise_prompt(plan_text: str, objections_json: str,
@@ -667,6 +682,120 @@ class RunReport:
     strategy: str = ""
     implement_attempted: bool = False
     implement_refused: bool = False
+    understanding_confirmed: bool = False
+
+
+UNDERSTANDING_KEY = "Task understanding confirmed by the human"
+
+
+def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) -> None:
+    if res.rate_limited:
+        report.outcome = "rate-limited"
+        report.error = (
+            f"{what} hit a rate/quota limit after {cfg.max_retries} retr(ies). On "
+            "5h/weekly coding-plan windows this usually means the window is spent "
+            f"- re-run after it resets. Detail: {res.stderr[:300]}")
+        log(f"RATE-LIMITED: {report.error}")
+    else:
+        report.outcome = "error"
+        report.error = f"{what}: {res.stderr or 'empty response'}"
+        log(f"ERROR {report.error}")
+
+
+def build_understanding_prompt(idea: str, repo: Path, clarifications: str = "") -> str:
+    base = (
+        "The human operator just entered this task for a two-agent coding workflow:\n"
+        f"---\n{idea}\n---\n"
+        f"Workspace the agents can see (may contain multiple repos): {repo}\n"
+        "\n"
+        "Before any work starts, restate YOUR understanding of the task so the human "
+        "can confirm it. Respond with ONLY the following structure, no commentary:\n"
+        "TASK TYPE: feature | bug fix | refactor | other (pick one, one line why)\n"
+        "INTENT: the problem or opportunity this addresses, one or two sentences\n"
+        "DESIRED OUTCOME: what will exist or be different when this is done\n"
+        "OUT OF SCOPE: what this explicitly will NOT touch\n"
+        "REPOS AFFECTED: which repos under the workspace this likely touches\n"
+        "SUCCESS CRITERIA: how we will know it worked\n"
+        "ASSUMPTIONS TO CONFIRM: anything you had to guess\n"
+    )
+    if clarifications:
+        base += (
+            "\nThe human already clarified earlier rounds:\n"
+            f"{clarifications}\n"
+            "Incorporate ALL of these into the restatement - do not lose them.\n"
+        )
+    return base
+
+
+def understanding_phase(idea: str, cfg: Config, report: RunReport,
+                        settled: dict) -> "tuple[bool, Optional[str], bool]":
+    """Drafter restates the task; the human confirms before loop tokens are spent.
+
+    Returns (ok, statement, confirmed). ok=False means the drafter call failed
+    (report is filled in - caller should exit). The confirmed statement is stored
+    in settled under UNDERSTANDING_KEY so it flows to the reviewer automatically
+    and is skipped on --decisions resume. Non-interactive runs record the
+    (unconfirmed) statement as an audit artifact without blocking.
+    """
+    if UNDERSTANDING_KEY in settled:
+        log("task understanding: already confirmed in decisions - skipping phase")
+        return True, settled[UNDERSTANDING_KEY], True
+    if cfg.dry_run:
+        log("DRY-RUN understanding statement: <dry-run: structured restatement of the task>")
+        return True, None, False
+
+    interactive = not cfg.non_interactive and sys.stdin.isatty()
+    clarifications = ""
+    rounds = 0
+    while True:
+        res = drafter(build_understanding_prompt(idea, cfg.repo, clarifications),
+                      cfg, None, "plan")
+        if not res.ok or not res.text.strip():
+            record_failure(res, "understanding pass failed", cfg, report)
+            return False, None, False
+        statement = res.text.strip()
+        rounds += 1
+
+        if not interactive:
+            log("non-interactive: drafter's understanding recorded (UNCONFIRMED):")
+            for line in statement.splitlines():
+                log(f"  | {line}")
+            (cfg.history_dir / "understanding.md").write_text(statement + "\n",
+                                                              encoding="utf-8")
+            return True, statement, False
+
+        print(f"\n===== DRAFTER'S UNDERSTANDING (round {rounds}) =====",
+              file=sys.stderr, flush=True)
+        print(statement, file=sys.stderr, flush=True)
+        print("=" * 52, file=sys.stderr, flush=True)
+        try:
+            ans = input("Does this match your intent? (y/n): ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans.startswith("y"):
+            settled[UNDERSTANDING_KEY] = statement
+            report.decisions = dict(settled)
+            report.understanding_confirmed = True
+            (cfg.history_dir / "understanding.md").write_text(statement + "\n",
+                                                              encoding="utf-8")
+            log("task understanding CONFIRMED - it now anchors the seed and review prompts")
+            return True, statement, True
+        if rounds >= 8:
+            log("note: 8+ clarification rounds - consider rewriting the task itself "
+                "(Ctrl+C, then rerun with a clearer prompt)")
+        print("Enter your clarification, one line at a time; a blank line finishes it:",
+              file=sys.stderr, flush=True)
+        clarify = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not line.strip() and clarify:
+                break
+            clarify.append(line)
+        if clarify:
+            clarifications += "- " + "\n- ".join(clarify) + "\n"
 
 
 def log_usage_estimate(cfg: Config, implement: bool) -> None:
@@ -700,19 +829,6 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
             if isinstance(v, (int, float)):
                 usage_by_agent[agent][k] = usage_by_agent[agent].get(k, 0) + v
 
-    def record_failure(res: AgentResult, what: str) -> None:
-        if res.rate_limited:
-            report.outcome = "rate-limited"
-            report.error = (
-                f"{what} hit a rate/quota limit after {cfg.max_retries} retr(ies). On "
-                "5h/weekly coding-plan windows this usually means the window is spent "
-                f"- re-run after it resets. Detail: {res.stderr[:300]}")
-            log(f"RATE-LIMITED: {report.error}")
-        else:
-            report.outcome = "error"
-            report.error = f"{what}: {res.stderr or 'empty response'}"
-            log(f"ERROR {report.error}")
-
     settled: dict = {}   # authoritative human decisions: question -> answer
     if cfg.decisions_file:
         settled = load_decisions_file(cfg.decisions_file)
@@ -722,9 +838,20 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
 
     log_usage_estimate(cfg, implement)
 
-    # --- seed: drafter produces plan v1 (skipped when resuming with decisions) ----
+    # --- understanding confirmation (step 0; skipped on resume) ---------------
     resume_run = (bool(cfg.decisions_file) and cfg.plan_path.exists()
                   and cfg.plan_path.stat().st_size > 0)
+    understanding: Optional[str] = None
+    if resume_run:
+        understanding = settled.get(UNDERSTANDING_KEY)
+        report.understanding_confirmed = understanding is not None
+    else:
+        ok, understanding, confirmed = understanding_phase(idea, cfg, report, settled)
+        if not ok:
+            return EXIT_ERROR
+        report.understanding_confirmed = confirmed
+
+    # --- seed: drafter produces plan v1 (skipped when resuming with decisions) ----
     if resume_run:
         plan_text = cfg.plan_path.read_text(encoding="utf-8").strip()
         log(f"resuming: reviewing existing {cfg.plan_path.name} ({len(plan_text)} chars); "
@@ -732,9 +859,9 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
             "plan or change --plan-out to force a fresh draft)")
     else:
         log(f"seed: asking drafter (claude) for plan v1 in {cfg.repo}")
-        seed = drafter(build_seed_prompt(idea, cfg.repo), cfg, drafter_session if cfg.strategy == "chained" else None, "plan")
+        seed = drafter(build_seed_prompt(idea, cfg.repo, understanding, report.understanding_confirmed), cfg, drafter_session if cfg.strategy == "chained" else None, "plan")
         if not seed.ok or not seed.text.strip():
-            record_failure(seed, "drafter seed failed")
+            record_failure(seed, "drafter seed failed", cfg, report)
             return EXIT_ERROR
         accumulate(seed.usage, "claude")
         if cfg.strategy == "chained":
@@ -755,7 +882,7 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
         review = reviewer(build_review_prompt(cfg.plan_path.name, cfg.review_rules, settled), cfg,
                           reviewer_session if cfg.strategy == "chained" else None)
         if not review.ok:
-            record_failure(review, "reviewer call failed")
+            record_failure(review, "reviewer call failed", cfg, report)
             return EXIT_ERROR
         accumulate(review.usage, "zcode")
         if cfg.strategy == "chained":
@@ -809,7 +936,7 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
         revised = drafter(build_revise_prompt(plan_text, objections_json, settled), cfg,
                           drafter_session if cfg.strategy == "chained" else None, "plan")
         if not revised.ok or not revised.text.strip():
-            record_failure(revised, "drafter revise failed")
+            record_failure(revised, "drafter revise failed", cfg, report)
             return EXIT_ERROR
         accumulate(revised.usage, "claude")
         if cfg.strategy == "chained":
@@ -872,7 +999,7 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
                                session_id=None, permission_mode="acceptEdits")
             accumulate(impl.usage, "claude")
             if not impl.ok:
-                record_failure(impl, "implement pass failed")
+                record_failure(impl, "implement pass failed", cfg, report)
                 return EXIT_ERROR
             log(f"implement pass finished ({len(impl.text)} chars of final commentary)")
             log("git steps are intentionally NOT automated; suggested:")
