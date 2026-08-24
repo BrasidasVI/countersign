@@ -25,9 +25,13 @@ ORCH="$SCRIPT_DIR/orchestrator.py"
 
 say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
 _clean_path() { # strip surrounding quotes and leading/trailing whitespace
+  # Order matters: trim spaces first (quotes may sit inside them), then quotes,
+  # then spaces again (in case spaces were inside the quotes).
   local __s=$1
+  __s="${__s#"${__s%%[![:space:]]*}"}"
+  __s="${__s%"${__s##*[![:space:]]}"}"
   __s="${__s#\"}"; __s="${__s%\"}"
-  __s="${__s#'}"; __s="${__s%'}"
+  __s="${__s#\'}"; __s="${__s%\'}"
   __s="${__s#"${__s%%[![:space:]]*}"}"
   __s="${__s%"${__s##*[![:space:]]}"}"
   printf '%s' "$__s"
