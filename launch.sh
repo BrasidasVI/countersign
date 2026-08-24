@@ -20,6 +20,21 @@ case "$SCRIPT_SOURCE" in
   */*) SCRIPT_DIR="$(cd "${SCRIPT_SOURCE%/*}" && pwd)" ;;
   *)   SCRIPT_DIR="$(pwd)" ;;
 esac
+
+# Execute from a private SNAPSHOT of this script: bash reads scripts
+# incrementally, so editing launch.sh while a run is live would otherwise
+# corrupt it mid-flight. The snapshot makes live edits harmless (the next
+# run picks them up).
+if [[ "${COUNTERSIGN_SNAP:-}" != "1" ]]; then
+  _snap="$(mktemp "${TMPDIR:-/tmp}/countersign.XXXXXX.sh")" || _snap=""
+  if [[ -n "$_snap" ]]; then
+    cat "$SCRIPT_DIR/launch.sh" > "$_snap"
+    exec env COUNTERSIGN_SNAP=1 SCRIPT_DIR_OVERRIDE="$SCRIPT_DIR" bash "$_snap" "$@"
+  fi
+fi
+SCRIPT_DIR="${SCRIPT_DIR_OVERRIDE:-$SCRIPT_DIR}"
+[[ "${COUNTERSIGN_SNAP:-}" == "1" ]] && trap 'rm -f "${BASH_SOURCE[0]}"' EXIT
+
 CONFIG_FILE="$SCRIPT_DIR/device-config.sh"
 ORCH="$SCRIPT_DIR/orchestrator.py"
 
