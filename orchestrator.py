@@ -953,9 +953,10 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
             f"{len(verdict.open_questions)} open questions) "
             f"- {verdict.summary[:100]}")
         for note in verdict.fyi_notes:
-            log(f"FYI (no decision needed): {note[:160]}")
-            if note not in report.fyi_notes:
-                report.fyi_notes.append(note)
+            if note in report.fyi_notes:
+                continue   # already surfaced in an earlier iteration
+            report.fyi_notes.append(note)
+            log(f"FYI (no decision needed): {note[:120]}")
 
         # --- human resolution phase: product/direction decisions --------------
         if verdict.open_questions:

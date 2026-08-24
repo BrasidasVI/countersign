@@ -281,12 +281,17 @@ while :; do
   break
 done
 
-run_orch() { # extra args...
+RUN_JSON="${TMPDIR:-/tmp}/countersign-last-run.json"
+
+run_orch() { # extra args... ; stdout (the one machine-readable JSON line) is
+  # captured to $RUN_JSON so the terminal shows the structured summary instead
+  # of a wall of raw JSON. Logs/heartbeats still stream live on stderr.
   "$PY" "$ORCH" "$TASK" \
     --repo "$WORKSPACE" \
     --max-iterations "$MAX_IT" \
     --strategy "$STRATEGY" \
-    "${IMPL_ARGS[@]}" "${RULES_ARGS[@]}" "${CLI_ARGS[@]}" "${EXTRA_ARGS[@]}" "$@"
+    "${IMPL_ARGS[@]}" "${RULES_ARGS[@]}" "${CLI_ARGS[@]}" "${EXTRA_ARGS[@]}" "$@" \
+    1>"$RUN_JSON"
 }
 
 # --- 3. one-time preflight per device ---------------------------------------
@@ -346,9 +351,78 @@ while [[ "$exit_code" -eq 4 || "$exit_code" -eq 5 ]]; do
 done
 
 echo ""
-case "$exit_code" in
-  0) say "Consensus reached. Plan: $WORKSPACE/plan.md | History: $WORKSPACE/plan-history" ;;
-  3) say "No consensus after $MAX_IT iterations - see $WORKSPACE/plan-history for remaining objections" ;;
-  *) say "Run ended with exit code $exit_code (see logs above)" ;;
-esac
+"$PY" - "$RUN_JSON" "$WORKSPACE" <<'PYSUM'
+import json, os, shutil, sys
+
+run_json, ws = sys.argv[1], sys.argv[2]
+BOLD, RESET = "\033[1m", "\033[0m"
+
+def title(s):
+    print(f"{BOLD}==> {s}{RESET}")
+
+try:
+    with open(run_json, encoding="utf-8") as fh:
+        r = json.load(fh)
+except Exception:
+    title("Run ended")
+    print("  (machine-readable report unavailable)")
+    sys.exit(0)
+
+def link(path, label):
+    p = str(path).replace("\\", "/")
+    if len(p) > 2 and p[1] == ":":
+        url = "file:///" + p
+    else:
+        url = "file://" + p
+    esc = "\x1b]8;;" + url + "\x1b\\"
+    return f"{esc}{label}\x1b]8;;\x1b\\  {p}"
+
+o = r.get("outcome", "error")
+if o == "consensus":
+    title(f"CONSENSUS reached in {r.get('iterations_used', '?')} iteration(s)")
+elif o == "no-consensus":
+    title(f"NO CONSENSUS after {r.get('iterations_used', '?')} iteration(s)")
+elif o == "rate-limited":
+    title("RATE-LIMITED (plan window likely spent - re-run after it resets)")
+else:
+    title(f"Run ended: {o}")
+
+if r.get("plan"):
+    print("  plan     :", link(r["plan"], "open plan.md"))
+hist = r.get("history_dir")
+if hist:
+    try:
+        shutil.copyfile(run_json, os.path.join(hist, "last-run.json"))
+        print("  history  :", link(hist, "plan-history") + f"  (report: {link(os.path.join(hist, 'last-run.json'), 'last-run.json')})")
+    except OSError:
+        print("  history  :", link(hist, "plan-history"))
+
+for b in (r.get("blocking_remaining") or [])[:5]:
+    print("  BLOCKING :", b.get("point", "")[:140])
+for q in (r.get("open_questions") or [])[:5]:
+    print("  OPEN Q   :", q.get("question", "")[:140])
+
+if r.get("implement_attempted"):
+    repos = ", ".join(os.path.basename(x) for x in r.get("repos_touched", []))
+    print(f"  changes  : {repos} edited (UNCOMMITTED - review with git diff, then commit)")
+elif r.get("implement_refused"):
+    print("  changes  : implement refused (see logs)")
+
+d = r.get("decisions") or {}
+u = r.get("usage") or {}
+cl = u.get("claude", {})
+zc = u.get("zcode", {})
+parts = []
+if cl:
+    parts.append(f"claude {cl.get('output_tokens', 0):,} out")
+if zc:
+    parts.append(f"zcode {zc.get('totalTokens', 0):,} total")
+extras = []
+if d:
+    extras.append(f"{len(d)} decision(s) settled")
+if r.get("fyi_notes"):
+    extras.append(f"{len(r['fyi_notes'])} FYI note(s) in report")
+line = "  usage    : " + " | ".join(parts) if parts else "  usage    : (none recorded)"
+print(line + ("   [" + "; ".join(extras) + "]" if extras else ""))
+PYSUM
 exit "$exit_code"
