@@ -26,7 +26,10 @@ ask_dir() { # ask_dir VAR "prompt" "default" ; must be an existing dir
   local __var=$1
   ask "$@"
   while [[ ! -d "${!__var}" ]]; do
-    read -r -p "Directory does not exist. Path: " __tmp || true
+    if ! read -r -p "Directory does not exist. Path: " __tmp; then
+      echo "No input available - aborting setup." >&2
+      exit 1
+    fi
     printf -v "$__var" '%s' "$__tmp"
   done
 }
@@ -78,6 +81,10 @@ sys.exit(0 if ok else 1)
 PYEOF
   do
     echo "One of the repos is not inside the workspace."
+    if [[ ! -t 0 ]]; then
+      echo "Non-interactive session with an invalid workspace - aborting." >&2
+      exit 1
+    fi
     ask_dir WORKSPACE "Workspace directory containing BOTH repos" "$WORKSPACE"
   done
 

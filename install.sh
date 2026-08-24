@@ -28,10 +28,13 @@ chmod +x "$BIN_DIR/countersign"
 
 # --- cmd/PowerShell shim (Windows only) --------------------------------------
 if [[ "$OS" == "windows" ]]; then
+  # Embed the ABSOLUTE bash path: plain 'bash' is not on the PATH of a clean
+  # PowerShell/cmd session, and the shim must work there.
+  BASH_EXE=$(cygpath -w "$(command -v bash)" 2>/dev/null || echo "bash")
   cat > "$BIN_DIR/countersign.cmd" <<SHIM
 @echo off
 rem Installed by countersign install.sh — repo at: $SCRIPT_DIR
-bash "$SCRIPT_DIR/launch.sh" %*
+"$BASH_EXE" "$SCRIPT_DIR/launch.sh" %*
 SHIM
 fi
 
