@@ -1020,9 +1020,15 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
         (cfg.history_dir / "run-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if not consensus:
-        log(f"NO CONSENSUS after {iterations_used} iterations. "
-            f"Remaining blocking objections are in {cfg.history_dir}/review-iter-{iterations_used:02d}.json. "
-            "Raise --max-iterations, loosen the idea, or inspect the objections yourself.")
+        log(f"NO CONSENSUS after {iterations_used} iteration(s). Unresolved objections:")
+        if verdict is not None:
+            for ob in verdict.blocking:
+                log(f"  BLOCKING: {ob['point']}")
+            for ob in verdict.minor:
+                log(f"  minor:    {ob['point']}")
+        log(f"Full detail (per-iteration reviews, open questions, decisions): "
+            f"{cfg.history_dir}/review-iter-{iterations_used:02d}.json - "
+            "raise --max-iterations, loosen the idea, or resolve the objections above.")
         return EXIT_NO_CONSENSUS
 
     log(f"CONSENSUS reached after {iterations_used} iteration(s). Final plan: {cfg.plan_path}")
