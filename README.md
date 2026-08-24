@@ -71,6 +71,19 @@ seed idea ──> claude drafts plan ──> zcode reviews (3 channels)
    temp directory). After that: confirm the task understanding, answer config
    prompts, and the loop runs.
 
+### The synthetic workspace
+
+You never pick a workspace directory. The launcher builds one at
+`~/.countersign/ws/<id>/` containing ONLY links (junctions on Windows,
+symlinks elsewhere) to your two repos - so the agents get full access to
+exactly those repos and nothing else (not the rest of your Documents
+folder). Run artifacts (`plan.md`, `plan-history/`, `open-questions.json`)
+live there too, keeping your repos pristine. The links self-heal at
+startup if missing. Implementation targets are chosen by the agents
+(the reviewer's `repos_touched` verdict); if a target sits on `main`/
+`master`, the run blocks before any edit and the launcher prompts you
+to create a branch for exactly that repo.
+
 ## Using it
 
 `./launch.sh` → answer config prompts (Enter accepts defaults) → type the task →

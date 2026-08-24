@@ -63,6 +63,44 @@ ask_yn() { # ask_yn VAR "prompt" "y|n default"
 
 # --- branch selection helpers (used by the blocked-on-branch resume path) ---
 git_branch_of() { git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?"; }
+
+_link_repo_into_ws() { # <wsdir> <name> <target> ; idempotent; NEVER touches target contents
+  local link="$1/$2" target
+  target=$(cd "$3" && pwd)
+  if [[ -L "$link" ]]; then
+    rm -f "$link"
+  elif [[ -e "$link" ]]; then
+    # existing junction/dir entry: remove the LINK only (rmdir on Windows does
+    # not recurse into the target; rm -rf on a junction could - avoid it)
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*) cmd //c rmdir "$(cygpath -w "$link")" >/dev/null 2>&1 ;;
+      *) rm -rf "$link" ;;
+    esac
+  fi
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # PowerShell junctions: cmd's mklink mangles args when invoked from Git Bash
+      powershell.exe -NoProfile -Command \
+        "New-Item -ItemType Junction -Path '$(cygpath -w "$link")' -Target '$(cygpath -w "$target")' | Out-Null" \
+        >/dev/null 2>&1 ;;
+    *) ln -s "$target" "$link" ;;
+  esac
+}
+
+build_workspace() { # build_workspace <backend> <frontend> [py] ; echoes the ws path
+  # Synthetic workspace: a directory containing ONLY links to the two repos, so
+  # the agents get full access to exactly those repos and nothing else. Run
+  # artifacts (plan.md, plan-history/) live here too, keeping repos pristine.
+  local backend=$1 frontend=$2 py=${3:-python} key
+  key=$("$py" -c "import hashlib,sys;print(hashlib.md5('|'.join(sys.argv[1:]).encode()).hexdigest()[:10])" \
+        "$backend" "$frontend" 2>/dev/null || echo "default")
+  local ws="$HOME/.countersign/ws/$key"
+  mkdir -p "$ws"
+  _link_repo_into_ws "$ws" backend "$backend"
+  _link_repo_into_ws "$ws" frontend "$frontend"
+  echo "$ws"
+}
+
 select_impl_branch() { # select_impl_branch <repo-path> ; returns 1 to abort
   local repo=$1 branch _cb NEW_BRANCH
   branch=$(git_branch_of "$repo")
@@ -104,46 +142,16 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   ask_dir BACKEND "Path to BACKEND repo" ""
   ask_dir FRONTEND "Path to FRONTEND repo" ""
 
-  # workspace: a directory containing BOTH repos. Default = their common
-  # parent; override if that is too broad (e.g. your home directory) or if
-  # the repos live in unrelated places.
-  WS_GUESS=$("$PY" - "$BACKEND" "$FRONTEND" <<'PYEOF' 2>/dev/null || echo ""
-import os, sys
-try:
-    print(os.path.commonpath([os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])]))
-except ValueError:
-    pass
-PYEOF
-)
-  if [[ -z "$WS_GUESS" || "$WS_GUESS" == "/" ]]; then
-    WS_GUESS="$(dirname "$BACKEND")"
-    echo "(Repos do not share a sensible common parent - please give the workspace dir explicitly.)"
-  fi
-  ask_dir WORKSPACE "Directory containing BOTH repos (agents see everything under it)" "$WS_GUESS"
-  while ! "$PY" - "$BACKEND" "$FRONTEND" "$WORKSPACE" <<'PYEOF'
-import os, sys
-ws = os.path.realpath(sys.argv[3])
-ok = all(os.path.realpath(p).startswith(ws.rstrip(os.sep) + os.sep) for p in sys.argv[1:3])
-sys.exit(0 if ok else 1)
-PYEOF
-  do
-    echo "One of the repos is not inside the workspace."
-    if [[ ! -t 0 ]]; then
-      echo "Non-interactive session with an invalid workspace - aborting." >&2
-      exit 1
-    fi
-    ask_dir WORKSPACE "Workspace directory containing BOTH repos" "$WORKSPACE"
-  done
-
   # optional CLI overrides (empty = auto-detect)
   ask ZCODE_CLI "Path to zcode.cjs (blank = auto-detect)" ""
   ask CLAUDE_CLI "Path to claude executable (blank = auto-detect)" ""
 
+  WS=$(build_workspace "$BACKEND" "$FRONTEND" "$PY")
   cat > "$CONFIG_FILE" <<EOF
 # Device-local launcher config (gitignored). Regenerate by deleting this file.
 BACKEND=$(printf '%q' "$BACKEND")
 FRONTEND=$(printf '%q' "$FRONTEND")
-WORKSPACE=$(printf '%q' "$WORKSPACE")
+WORKSPACE=$(printf '%q' "$WS")
 PY=$(printf '%q' "$PY")
 ZCODE_CLI=$(printf '%q' "$ZCODE_CLI")
 CLAUDE_CLI=$(printf '%q' "$CLAUDE_CLI")
@@ -151,11 +159,19 @@ PREFLIGHT_DONE=no
 EOF
   echo ""
   say "Saved device config. (Backend: $BACKEND | Frontend: $FRONTEND)"
+  say "Workspace (links to the two repos ONLY): $WS"
 fi
 
 # shellcheck disable=source=missing-file
 source "$CONFIG_FILE"
 PY="${PY:-python}"
+
+# Self-heal: rebuild the synthetic workspace if its links are missing
+# (fresh clone, cleaned ~/.countersign, moved repos + regenerated config).
+if [[ -n "${WORKSPACE:-}" ]] && { [[ ! -d "$WORKSPACE/backend" ]] || [[ ! -d "$WORKSPACE/frontend" ]]; }; then
+  WORKSPACE=$(build_workspace "$BACKEND" "$FRONTEND" "$PY")
+  echo "workspace links rebuilt -> $WORKSPACE"
+fi
 
 # --- 2. per-run configuration ----------------------------------------------
 say "STEP 2 of 3 - loop configuration"
