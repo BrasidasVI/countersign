@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # countersign
 
 A scripted consensus loop between two AI coding agents: **Claude Code drafts the
@@ -122,3 +123,6 @@ The full architecture — three-channel verdicts (objections / open_questions /
 fyi_notes), human resolution semantics, invariants, CI output contract, rate-limit
 handling, and the v2 post-implementation-review design — is documented in
 `orchestrator.py`'s module docstring, which is the canonical spec.
+=======
+One prompt starts a two-agent consensus loop: Claude Code drafts the plan, ZCode (GLM) reviews it, and product decisions escalate to you for sign-off. The deliverable is a review-ready plan, or an implementation staged for you to commit and test.
+>>>>>>> origin/main
