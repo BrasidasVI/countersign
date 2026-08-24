@@ -24,9 +24,18 @@ CONFIG_FILE="$SCRIPT_DIR/device-config.sh"
 ORCH="$SCRIPT_DIR/orchestrator.py"
 
 say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
+_clean_path() { # strip surrounding quotes and leading/trailing whitespace
+  local __s=$1
+  __s="${__s#\"}"; __s="${__s%\"}"
+  __s="${__s#'}"; __s="${__s%'}"
+  __s="${__s#"${__s%%[![:space:]]*}"}"
+  __s="${__s%"${__s##*[![:space:]]}"}"
+  printf '%s' "$__s"
+}
 ask()  { # ask VAR "prompt" "default" ; empty answer keeps default
   local __var=$1 __prompt=$2 __def=$3 __ans=""
   read -r -p "$__prompt [$__def]: " __ans || true
+  __ans=$(_clean_path "$__ans")
   printf -v "$__var" '%s' "${__ans:-$__def}"
 }
 ask_dir() { # ask_dir VAR "prompt" "default" ; must be an existing dir
@@ -37,6 +46,7 @@ ask_dir() { # ask_dir VAR "prompt" "default" ; must be an existing dir
       echo "No input available - aborting setup." >&2
       exit 1
     fi
+    __tmp=$(_clean_path "$__tmp")
     printf -v "$__var" '%s' "$__tmp"
   done
 }
