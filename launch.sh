@@ -51,6 +51,7 @@ ask_yn() { # ask_yn VAR "prompt" "y|n default"
 if [[ ! -f "$CONFIG_FILE" ]]; then
   say "First run on this device: collecting device-local paths"
   echo "(Saved to $CONFIG_FILE, which is gitignored. Delete it to re-configure.)"
+  echo "Press Enter to accept the default shown in brackets."
   echo ""
 
   # python
@@ -118,7 +119,8 @@ source "$CONFIG_FILE"
 PY="${PY:-python}"
 
 # --- 2. per-run configuration ----------------------------------------------
-say "Loop configuration (Enter accepts the default)"
+say "Loop configuration"
+echo "Press Enter to accept the default shown in brackets."
 echo ""
 ask MAX_IT "Max review->revise iterations" "4"
 ask STRATEGY "Session strategy (fresh | chained)" "fresh"
