@@ -152,8 +152,10 @@ def resolve_zcode_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     if dry_run:
         return ["node", "<path-to-zcode.cjs>"]
     raise OrchestratorError(
-        "Could not locate the ZCode CLI. Pass --zcode-cli <path to zcode.cjs> "
-        f"(looked in: {', '.join(str(c) for c in candidates)})."
+        "Could not locate the ZCode CLI. Prerequisite missing? Install the ZCode "
+        "desktop app from https://z.ai and log in once (its bundled CLI is what we "
+        "invoke), or pass --zcode-cli <path to zcode.cjs> "
+        f"(also looked in: {', '.join(str(c) for c in candidates)})."
     )
 
 
@@ -179,8 +181,9 @@ def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     if dry_run:
         return ["claude"]
     raise OrchestratorError(
-        "Could not locate the claude CLI. Install Claude Code and log in "
-        "(claude.ai/code), or pass --claude-cli <path>."
+        "Could not locate the claude CLI. Prerequisite missing? Install Claude Code "
+        "from https://claude.ai/code and log in once ('claude' at a terminal), "
+        "or pass --claude-cli <path>."
     )
 
 

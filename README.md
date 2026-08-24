@@ -24,17 +24,22 @@ seed idea ──> claude drafts plan ──> zcode reviews (3 channels)
 |---|---|
 | `orchestrator.py` | The loop itself (Python 3.9+, stdlib only). Full design docs in its docstring. |
 | `launch.sh` | Interactive launcher: device setup, per-run config, task prompt, auto-resume after human decisions. |
+| `install.sh` | Installs the global `countersign` command on the device (Windows + Linux/macOS). |
 | `agent-review-rules.md` | Review invariants (Ladderly-specific; edit to taste). Merges additively over built-in defaults. |
 | `examples/` | Sample plans used to validate the review channels live. |
 
-## Setup on a new device
+## Setup on a new device (Windows with Git Bash, or Linux)
 
 1. **Clone this repo.**
 2. **Python 3.9+** and **node** on PATH.
-3. **Claude Code** installed and logged in (`claude` on PATH): https://claude.ai/code
-4. **ZCode** (the desktop app bundles the CLI). The headless CLI needs a one-time
-   provider config at `~/.zcode/cli/config.json` (separate from the desktop app's
-   own config — this is a known 0.16.3 quirk). Minimal working example:
+3. **Prerequisites** — verified automatically on first run, with install
+   instructions in the error if missing:
+   - **Claude Code** installed and logged in (`claude` on PATH): https://claude.ai/code
+   - **ZCode** desktop app installed and logged in once (its bundled CLI is
+     what gets invoked): https://z.ai
+4. **ZCode headless config** (one-time quirk): the headless CLI reads
+   `~/.zcode/cli/config.json`, separate from the desktop app's own config
+   (known ZCode 0.16.3 behavior). Minimal working example:
 
    ```json
    {
@@ -51,9 +56,23 @@ seed idea ──> claude drafts plan ──> zcode reviews (3 channels)
    Note `model.main` must be the STRING `"provider/model"`. The API key is read
    from the `ZCODE_API_KEY` environment variable, or auto-loaded from the ZCode
    desktop app's config (`~/.zcode/v2/config.json`) if you're logged in there.
-5. Run `./launch.sh`. First run asks for your backend/frontend repo paths (saved
-   to `device-config.sh`, gitignored), runs `--preflight` once to verify both
-   CLIs, then walks you through the run.
+5. **Install the command** (once per device, idempotent):
+
+   ```bash
+   ./install.sh
+   ```
+
+   This installs `countersign` (bash) into `~/.local/bin` — plus
+   `countersign.cmd` on Windows so it also works in PowerShell/cmd — pointing
+   at this clone. PATH is set up for you (with instructions if the automatic
+   step is unavailable). Re-run it if you move or re-clone the repo.
+   Uninstall = delete the shim file(s).
+
+6. Run **`countersign` from any directory**. First run asks for your
+   backend/frontend repo paths (saved to `device-config.sh`, gitignored), then
+   verifies both CLIs via `--preflight` (run once per device, in an isolated
+   temp directory). After that: confirm the task understanding, answer config
+   prompts, and the loop runs.
 
 ## Using it
 
