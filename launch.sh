@@ -188,10 +188,11 @@ ask_yn DO_IMPL "Let claude IMPLEMENT after consensus" "n"
 IMPL_ARGS=()
 [[ "$DO_IMPL" == "y" ]] && IMPL_ARGS=(--implement)
 
+# The rules file's presence IS the opt-in (rename/remove it to run without).
 RULES_ARGS=()
 if [[ -f "$SCRIPT_DIR/agent-review-rules.md" ]]; then
-  ask_yn USE_RULES "Use agent-review-rules.md review invariants" "y"
-  [[ "$USE_RULES" == "y" ]] && RULES_ARGS=(--review-rules "$SCRIPT_DIR/agent-review-rules.md")
+  RULES_ARGS=(--review-rules "$SCRIPT_DIR/agent-review-rules.md")
+  echo "review invariants: built-in defaults + agent-review-rules.md"
 fi
 
 read -r -p "Additional orchestrator flags (optional, e.g. --max-retries 0): " EXTRA_ARGS_RAW || true
