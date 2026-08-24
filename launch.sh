@@ -218,8 +218,8 @@ build_args() {
 show_config() {
   say "Current configuration (type /config at the prompt below to change it)"
   echo "  workspace : $WORKSPACE"
-  echo "  repos     : backend  = $BACKEND"
-  echo "               frontend = $FRONTEND"
+  echo "  repos     : backend  = $BACKEND (branch: $(git_branch_of "$BACKEND"))"
+  echo "               frontend = $FRONTEND (branch: $(git_branch_of "$FRONTEND"))"
   echo "  loop      : max iterations $MAX_IT | strategy $STRATEGY | implement after consensus: $DO_IMPL"
   local rules="built-in invariants"
   [[ ${#RULES_ARGS[@]} -gt 0 ]] && rules="built-in + agent-review-rules.md"
