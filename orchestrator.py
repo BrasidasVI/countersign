@@ -122,6 +122,7 @@ EXIT_CONSENSUS = 0
 EXIT_ERROR = 2
 EXIT_NO_CONSENSUS = 3
 EXIT_BLOCKED_ON_HUMAN = 4
+EXIT_BLOCKED_ON_BRANCH = 5
 
 DEFAULT_MAX_ITERATIONS = 4
 DEFAULT_TIMEOUT_SECS = 900
@@ -419,9 +420,13 @@ def build_review_prompt(plan_name: str, rules_text: str, settled: Optional[dict]
         '"why": "what it affects", "options": ["realistic option", "..."], '
         '"recommendation": "your recommended option and one-line reason"}], '
         '"fyi_notes": ["short observation the human should be aware of"], '
+        '"repos_touched": ["name of each repo under the workspace whose files the plan modifies"], '
         '"summary": "one sentence overall assessment"}\n'
         "\n"
         "Rules:\n"
+        "- repos_touched must list every repo (by directory name) the plan's "
+        "file-level changes live in - it drives which repos get implementation "
+        "passes.\n"
         '- verdict "approve" ONLY if there are zero blocking objections AND '
         "open_questions is empty.\n"
         "- Every objection must be concrete, actionable, and about the plan content.\n"
@@ -567,6 +572,7 @@ class Verdict:
     minor: list
     open_questions: list
     fyi_notes: list
+    repos_touched: list
     summary: str
     raw: str
 
@@ -578,7 +584,7 @@ def parse_verdict(text: str) -> Verdict:
         return Verdict(False, False, [{"severity": "blocking",
                                        "point": "Reviewer output was not valid JSON; "
                                                 "treated as a blocking objection for safety."}],
-                       [], [], [], "unparseable reviewer output", text)
+                       [], [], [], [], "unparseable reviewer output", text)
     verdict = str(data.get("verdict", "revise")).lower()
     blocking, minor = [], []
     for ob in data.get("objections", []) or []:
@@ -603,6 +609,11 @@ def parse_verdict(text: str) -> Verdict:
             "options": [str(o).strip() for o in (q.get("options") or []) if str(o).strip()],
             "recommendation": str(q.get("recommendation", "")).strip(),
         })
+    repos_touched = []
+    for r in data.get("repos_touched", []) or []:
+        r = str(r).strip().strip("/").lower()
+        if r:
+            repos_touched.append(r)
     fyi_notes = []
     for n in data.get("fyi_notes", []) or []:
         if isinstance(n, dict):
@@ -616,7 +627,7 @@ def parse_verdict(text: str) -> Verdict:
     # deliberately never affect approval - they are awareness-only.
     approve = verdict == "approve" and not blocking and not open_questions
     return Verdict(approve, True, blocking, minor, open_questions, fyi_notes,
-                   str(data.get("summary", "")), text)
+                   repos_touched, str(data.get("summary", "")), text)
 
 
 # --------------------------------------------------------------------------
@@ -697,6 +708,8 @@ class RunReport:
     implement_attempted: bool = False
     implement_refused: bool = False
     understanding_confirmed: bool = False
+    repos_touched: list = field(default_factory=list)
+    branch_blocked_repos: list = field(default_factory=list)
 
 
 UNDERSTANDING_KEY = "Task understanding confirmed by the human"
@@ -835,6 +848,8 @@ def log_usage_estimate(cfg: Config, implement: bool) -> None:
 def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
     usage_by_agent: dict = {"claude": {}, "zcode": {}}
     report.usage = usage_by_agent
+    if not cfg.dry_run:
+        cfg.history_dir.mkdir(parents=True, exist_ok=True)
     drafter_session: Optional[str] = None
     reviewer_session: Optional[str] = None
 
@@ -991,22 +1006,31 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
     log(f"CONSENSUS reached after {iterations_used} iteration(s). Final plan: {cfg.plan_path}")
 
     if implement:
-        targets = cfg.implement_repos or [cfg.repo]
+        # Targets are chosen by the agents (reviewer verdict / understanding),
+        # overridable by --implement-repo. The human only owns git state.
+        targets = cfg.implement_repos or resolve_implement_targets(cfg, verdict, understanding)
+        report.repos_touched = [str(t) for t in targets]
+        log(f"implement targets (chosen by the agents): "
+            f"{', '.join(t.name for t in targets)}")
         if cfg.dry_run:
             for t in targets:
                 log(f"DRY-RUN implement pass for {t} (claude --permission-mode acceptEdits)")
         else:
-            # Mechanical guard: prompt-level "target dev only" rules are advisory;
-            # this check is deterministic. Each target repo is guarded individually;
-            # a multi-repo workspace root is not itself a git repo.
+            # Check ALL branches before any pass runs: a partial implementation
+            # because one repo sat on main is worse than a clean block.
+            blocked = [(t, _git_branch(t)) for t in targets
+                       if _git_branch(t) in ("main", "master")]
+            if blocked:
+                for t, b in blocked:
+                    log(f"implement BLOCKED: {t} is on '{b}'. "
+                        "Create a feature branch (git -C <repo> checkout -b agent/plan-impl) "
+                        "and re-run; nothing has been edited.")
+                report.outcome = "blocked-on-branch"
+                report.implement_refused = True
+                report.branch_blocked_repos = [str(t) for t, _ in blocked]
+                return EXIT_BLOCKED_ON_BRANCH
             for target_repo in targets:
                 branch = _git_branch(target_repo)
-                if branch in ("main", "master"):
-                    log(f"implement pass REFUSED for {target_repo}: on '{branch}'. "
-                        "Create a feature branch first (e.g. git checkout -b agent/plan-impl). "
-                        "Skipping this repo.")
-                    report.implement_refused = True
-                    continue
                 if branch is None:
                     log(f"note: {target_repo} is not a git repo (or git unavailable); "
                         "branch guard skipped")
@@ -1109,6 +1133,45 @@ def resolve_open_questions(questions: list, settled: dict, cfg: Config,
         f"question(s) written to {out_path}. Fill the 'answer' fields and re-run "
         f"with --decisions {out_path.name}")
     return None
+
+
+def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"],
+                              understanding: Optional[str]) -> list:
+    """Which repos the implement pass should edit - decided by the AGENTS, not
+    the human: the reviewer's repos_touched verdict first, then the confirmed
+    understanding's REPOS AFFECTED line, else all repos under the workspace.
+    --implement-repo flags still override for manual control."""
+    candidates = []
+    if (cfg.repo / ".git").exists():
+        candidates = [cfg.repo]           # single-repo workspace
+    else:
+        for child in sorted(cfg.repo.iterdir()):
+            if child.is_dir() and not child.name.startswith(".") and (child / ".git").exists():
+                candidates.append(child)
+    if not candidates:
+        candidates = [cfg.repo]
+
+    names = set()
+    if verdict is not None:
+        for r in verdict.repos_touched:
+            names.add(r)
+            names.add(r.split("/")[-1])
+    if not names and understanding:
+        import re as _re
+        m = _re.search(r"REPOS AFFECTED:?\s*(.+)", understanding, _re.IGNORECASE)
+        if m:
+            blob = m.group(1).lower()
+            names = {c.name.lower() for c in candidates if c.name.lower() in blob}
+    if not names:
+        log("implement targets: agents named no repos - defaulting to all repos "
+            f"under the workspace ({', '.join(c.name for c in candidates)})")
+        return candidates
+    picked = [c for c in candidates
+              if c.name.lower() in names or str(c).lower().replace(chr(92), "/") in names]
+    if not picked:
+        log("implement targets: agent-named repos matched nothing here - defaulting to all")
+        return candidates
+    return picked
 
 
 def _git_branch(repo: Path) -> Optional[str]:
