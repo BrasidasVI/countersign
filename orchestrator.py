@@ -112,6 +112,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -126,6 +127,8 @@ EXIT_BLOCKED_ON_BRANCH = 5
 
 DEFAULT_MAX_ITERATIONS = 4
 DEFAULT_TIMEOUT_SECS = 900
+DEFAULT_HEARTBEAT_SECS = 30
+HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main()
 
 
 class OrchestratorError(RuntimeError):
@@ -313,6 +316,21 @@ def _invoke_with_retries(fn, *, cfg, label: str) -> AgentResult:
 def _run(cmd: list[str], *, timeout: int, cwd: Path, env_extra: dict, stdin_text: str = "") -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.update(env_extra)
+    # Heartbeat: a long model call (drafting, reviews, implement passes) can run
+    # for minutes with the parent silent; periodic progress lines make a live
+    # run distinguishable from a hung one.
+    label = _preview_cmd(cmd)
+    beat_secs = max(5, HEARTBEAT_SECS)
+    _stop = threading.Event()
+
+    def _beat() -> None:
+        n = 0
+        while not _stop.wait(beat_secs):
+            n += 1
+            log(f"... in flight: {label} ({n * beat_secs}s elapsed)")
+
+    _beater = threading.Thread(target=_beat, daemon=True)
+    _beater.start()
     try:
         return subprocess.run(
             cmd,
@@ -326,9 +344,12 @@ def _run(cmd: list[str], *, timeout: int, cwd: Path, env_extra: dict, stdin_text
             env=env,
         )
     except subprocess.TimeoutExpired:
-        raise OrchestratorError(f"Command timed out after {timeout}s: {_preview_cmd(cmd)}")
+        raise OrchestratorError(f"Command timed out after {timeout}s: {label}")
     except OSError as e:
-        raise OrchestratorError(f"Failed to launch {_preview_cmd(cmd)}: {e}")
+        raise OrchestratorError(f"Failed to launch {label}: {e}")
+    finally:
+        _stop.set()
+        _beater.join(timeout=1)
 
 
 def call_zcode(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = None,
@@ -652,6 +673,7 @@ class Config:
     max_retries: int = 2
     retry_base_delay: int = 30
     implement_repos: list = field(default_factory=list)
+    heartbeat_secs: int = DEFAULT_HEARTBEAT_SECS
 
 
 def log(msg: str) -> None:
@@ -1302,6 +1324,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "with outcome 'rate-limited'")
     p.add_argument("--retry-base-delay", type=int, default=30,
                    help="base backoff delay in seconds; doubles each retry (default 30)")
+    p.add_argument("--heartbeat", type=int, default=DEFAULT_HEARTBEAT_SECS,
+                   help="seconds between in-flight progress lines during long agent "
+                        f"calls (default {DEFAULT_HEARTBEAT_SECS}; 0 disables)")
     p.add_argument("--zcode-cli", help="explicit path to zcode.cjs")
     p.add_argument("--claude-cli", help="explicit path to the claude executable")
     p.add_argument("--review-rules", metavar="FILE",
@@ -1363,6 +1388,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             retry_base_delay=max(1, args.retry_base_delay),
             implement_repos=([Path(r).resolve() for r in args.implement_repo]
                              if args.implement_repo else []),
+            heartbeat_secs=max(0, args.heartbeat),
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
         log(f"reviewer: {' '.join(cfg.zcode_cmd)}")
@@ -1370,6 +1396,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             log("WARNING: no ZCODE_API_KEY found (env or ~/.zcode/v2/config.json); "
                 "reviewer calls will likely fail.")
         log(f"strategy={cfg.strategy} max-iterations={cfg.max_iterations} repo={cfg.repo}")
+        global HEARTBEAT_SECS
+        HEARTBEAT_SECS = cfg.heartbeat_secs
         report = RunReport(
             plan=str(cfg.plan_path), history_dir=str(cfg.history_dir),
             strategy=cfg.strategy)
