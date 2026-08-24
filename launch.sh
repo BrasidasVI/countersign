@@ -109,6 +109,7 @@ build_workspace() { # build_workspace <backend> <frontend> [py] ; echoes the ws 
   local backend=$1 frontend=$2 py=${3:-python} key
   key=$("$py" -c "import hashlib,sys;print(hashlib.md5('|'.join(sys.argv[1:]).encode()).hexdigest()[:10])" \
         "$backend" "$frontend" 2>/dev/null || echo "default")
+  key=${key//$'\r'/}   # Windows python emits CRLF to pipes; strip it
   local ws="$HOME/.countersign/ws/$key"
   mkdir -p "$ws"
   _link_repo_into_ws "$ws" backend "$backend"
@@ -231,7 +232,9 @@ build_args() {
 }
 
 python_model_fallback() {
-  "$PY" -c "import json,pathlib;p=pathlib.Path.home()/'.zcode/cli/config.json';print('zcode '+json.loads(p.read_text()).get('model',{}).get('main','(model unknown - run preflight)'))" 2>/dev/null || echo "zcode (model unknown)"
+  local m
+  m=$("$PY" -c "import json,pathlib;p=pathlib.Path.home()/'.zcode/cli/config.json';print('zcode '+json.loads(p.read_text()).get('model',{}).get('main','(model unknown - run preflight)'))" 2>/dev/null || echo "zcode (model unknown)")
+  printf '%s' "${m//$'\r'/}"
 }
 
 show_config() {
@@ -301,8 +304,8 @@ if [[ "${PREFLIGHT_DONE:-no}" != "yes" ]]; then
   if [[ $? -eq 0 ]]; then
     sed -i.bak 's/^PREFLIGHT_DONE=.*/PREFLIGHT_DONE=yes/' "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
     # persist the detected agent models for the config summary
-    AGENT_DRAFTER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('claude',''))" 2>/dev/null)
-    AGENT_REVIEWER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('zcode',''))" 2>/dev/null)
+    AGENT_DRAFTER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('claude',''))" 2>/dev/null | tr -d '\r')
+    AGENT_REVIEWER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('zcode',''))" 2>/dev/null | tr -d '\r')
     [[ -n "$AGENT_DRAFTER" ]]  && printf 'AGENT_DRAFTER=%q
 '  "$AGENT_DRAFTER"  >> "$CONFIG_FILE"
     [[ -n "$AGENT_REVIEWER" ]] && printf 'AGENT_REVIEWER=%q
@@ -425,4 +428,44 @@ if r.get("fyi_notes"):
 line = "  usage    : " + " | ".join(parts) if parts else "  usage    : (none recorded)"
 print(line + ("   [" + "; ".join(extras) + "]" if extras else ""))
 PYSUM
+
+# --- optional commit: local only, human-confirmed, never pushed --------------
+COMMIT_REPOS=$("$PY" - "$RUN_JSON" "$BACKEND" "$FRONTEND" 2>/dev/null <<'PYCM'
+import json, os, sys
+try:
+    r = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+if r.get("outcome") == "consensus" and r.get("implement_attempted"):
+    real = {os.path.basename(os.path.normpath(p)): p for p in sys.argv[2:4]}
+    for touched in r.get("repos_touched", []):
+        name = os.path.basename(os.path.normpath(touched))
+        if name in real:
+            print(real[name])
+PYCM
+)
+COMMIT_REPOS=${COMMIT_REPOS//$'\r'/}
+if [[ -n "$COMMIT_REPOS" ]]; then
+  echo ""
+  say "Uncommitted changes from this run:"
+  for repo in $COMMIT_REPOS; do
+    echo "  -- $repo ($(git -C "$repo" branch --show-current)):"
+    git -C "$repo" status --short | head -10
+    git -C "$repo" diff --stat | tail -2
+  done
+  ask_yn DO_COMMIT "Stage and commit these changes (local only - push stays manual)" "y"
+  if [[ "$DO_COMMIT" == "y" ]]; then
+    MSG_DEFAULT="countersign: $(printf '%s' "$TASK" | head -1 | cut -c1-70)"
+    ask COMMIT_MSG "Commit message" "$MSG_DEFAULT"
+    for repo in $COMMIT_REPOS; do
+      if [[ -z "$(git -C "$repo" status --porcelain)" ]]; then
+        echo "  no changes to commit in $repo"
+      elif git -C "$repo" add -A && git -C "$repo" commit -m "$COMMIT_MSG"; then
+        echo "  committed in $repo: $(git -C "$repo" log -1 --oneline)"
+      else
+        echo "  WARNING: commit failed in $repo - check git status." >&2
+      fi
+    done
+  fi
+fi
 exit "$exit_code"
