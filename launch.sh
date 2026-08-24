@@ -12,7 +12,14 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve our own directory WITHOUT dirname: when launched via the Windows
+# .cmd shim, bash starts with the caller's PATH and Git's Unix tools are not
+# on it (cd/pwd are builtins, so they always work).
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$SCRIPT_SOURCE" in
+  */*) SCRIPT_DIR="$(cd "${SCRIPT_SOURCE%/*}" && pwd)" ;;
+  *)   SCRIPT_DIR="$(pwd)" ;;
+esac
 CONFIG_FILE="$SCRIPT_DIR/device-config.sh"
 ORCH="$SCRIPT_DIR/orchestrator.py"
 

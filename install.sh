@@ -22,7 +22,9 @@ mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/countersign" <<SHIM
 #!/usr/bin/env bash
 # Installed by countersign install.sh — repo at: $SCRIPT_DIR
-exec bash "$SCRIPT_DIR/launch.sh" "\$@"
+# -l: login shell so Git's Unix toolchain (sed/cat/etc.) is on PATH even when
+# launched from a bare cmd/PowerShell environment.
+exec bash -l "$SCRIPT_DIR/launch.sh" "\$@"
 SHIM
 chmod +x "$BIN_DIR/countersign"
 
@@ -34,7 +36,7 @@ if [[ "$OS" == "windows" ]]; then
   cat > "$BIN_DIR/countersign.cmd" <<SHIM
 @echo off
 rem Installed by countersign install.sh — repo at: $SCRIPT_DIR
-"$BASH_EXE" "$SCRIPT_DIR/launch.sh" %*
+"$BASH_EXE" -l "$SCRIPT_DIR/launch.sh" %*
 SHIM
 fi
 
@@ -44,6 +46,12 @@ case ":$PATH:" in *":$BIN_DIR:"*) on_path=1 ;; esac
 
 if [[ $on_path -eq 0 ]]; then
   # bash shells (both OSes)
+  # Git Bash login shells read .bash_profile, not .bashrc; provide the bridge
+  if [[ "$OS" == "windows" && ! -f "$HOME/.bash_profile" && -f "$HOME/.bashrc" ]]; then
+    printf '[[ -f ~/.bashrc ]] && . ~/.bashrc
+' > "$HOME/.bash_profile"
+    echo "Created ~/.bash_profile sourcing ~/.bashrc (login shells need the bridge)"
+  fi
   if ! grep -qs '\.local/bin' "$HOME/.bashrc" 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
     echo "Added ~/.local/bin to PATH via ~/.bashrc"
