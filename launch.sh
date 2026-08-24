@@ -142,14 +142,44 @@ ask_yn DO_IMPL "Let claude IMPLEMENT after consensus" "n"
 
 IMPL_REPO_ARGS=()
 if [[ "$DO_IMPL" == "y" ]]; then
+  BE_BRANCH=$(git -C "$BACKEND" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  FE_BRANCH=$(git -C "$FRONTEND" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
   echo "Which repo does this implementation target?"
-  echo "  1) backend  ($BACKEND)"
-  echo "  2) frontend ($FRONTEND)"
+  echo "  1) backend  ($BACKEND, branch: $BE_BRANCH)"
+  echo "  2) frontend ($FRONTEND, branch: $FE_BRANCH)"
   ask IMPL_CHOICE "Target (1/2)" "1"
   case "$IMPL_CHOICE" in
-    2) IMPL_REPO_ARGS=(--implement-repo "$FRONTEND") ;;
-    *) IMPL_REPO_ARGS=(--implement-repo "$BACKEND") ;;
+    2) IMPL_REPO="$FRONTEND"; IMPL_BRANCH="$FE_BRANCH" ;;
+    *) IMPL_REPO="$BACKEND";  IMPL_BRANCH="$BE_BRANCH" ;;
   esac
+  IMPL_REPO_ARGS=(--implement-repo "$IMPL_REPO")
+
+  if [[ "$IMPL_BRANCH" == "?" ]]; then
+    echo "warning: could not read the git branch of the target repo."
+    ask_yn CONT_IMPL "Continue anyway (the branch guard will be skipped)" "n"
+    [[ "$CONT_IMPL" == "n" ]] && exit 1
+  elif [[ "$IMPL_BRANCH" == "main" || "$IMPL_BRANCH" == "master" ]]; then
+    echo "Target repo is on '$IMPL_BRANCH' - countersign does not implement on main/master."
+    ask NEW_BRANCH "New branch name to create and switch to" "agent/plan-impl"
+    if git -C "$IMPL_REPO" checkout -b "$NEW_BRANCH"; then
+      echo "OK: $IMPL_REPO is now on new branch '$NEW_BRANCH'."
+    else
+      echo "Branch creation failed - aborting." >&2
+      exit 1
+    fi
+  else
+    ask NEW_BRANCH "Branch: Enter = stay on '$IMPL_BRANCH', or type a NEW branch name to create" ""
+    if [[ -n "$NEW_BRANCH" ]]; then
+      if git -C "$IMPL_REPO" checkout -b "$NEW_BRANCH"; then
+        echo "OK: $IMPL_REPO is now on new branch '$NEW_BRANCH'."
+      else
+        echo "Branch creation failed - aborting." >&2
+        exit 1
+      fi
+    else
+      echo "Implementation will run on branch '$IMPL_BRANCH' in $IMPL_REPO (uncommitted; you review and commit)."
+    fi
+  fi
 fi
 
 RULES_ARGS=()
