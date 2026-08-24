@@ -1,4 +1,4 @@
-# Dual-Agent Orchestrator
+# countersign
 
 A scripted consensus loop between two AI coding agents: **Claude Code drafts the
 plan, ZCode (GLM) reviews it**, and the loop runs until the reviewer approves —
