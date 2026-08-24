@@ -63,7 +63,7 @@ ask_yn() { # ask_yn VAR "prompt" "y|n default"
 
 # --- 1. device-local configuration (first run only) ------------------------
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  say "First run on this device: collecting device-local paths"
+  say "STEP 1 of 3 - device setup (once per device): local paths"
   echo "(Saved to $CONFIG_FILE, which is gitignored. Delete it to re-configure.)"
   echo "Press Enter to accept the default shown in brackets."
   echo ""
@@ -133,7 +133,7 @@ source "$CONFIG_FILE"
 PY="${PY:-python}"
 
 # --- 2. per-run configuration ----------------------------------------------
-say "Loop configuration"
+say "STEP 2 of 3 - loop configuration"
 echo "Press Enter to accept the default shown in brackets."
 echo ""
 ask MAX_IT "Max review->revise iterations" "4"
@@ -163,8 +163,9 @@ EXTRA_ARGS=()
 [[ -n "$EXTRA_ARGS_RAW" ]] && read -r -a EXTRA_ARGS <<< "$EXTRA_ARGS_RAW"
 
 echo ""
-say "Task prompt - describe what the agents should work on."
-echo "   Enter a blank line when done. (Ctrl+C cancels.)"
+say "STEP 3 of 3 - YOUR TASK PROMPT: type what the agents should work on"
+echo "   This is the prompt that starts the collaboration."
+echo "   Finish with a blank line (press Enter twice). Ctrl+C cancels."
 TASK=""
 while :; do
   IFS= read -r line || break
