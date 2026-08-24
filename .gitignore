@@ -8,3 +8,5 @@ device-config.sh.bak
 
 # Occasional local artifacts
 *.log
+run-config.sh
+run-config.sh.bak

@@ -126,7 +126,7 @@ select_impl_branch() { # select_impl_branch <repo-path> ; returns 1 to abort
 
 # --- 1. device-local configuration (first run only) ------------------------
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  say "STEP 1 of 3 - device setup (once per device): local paths"
+  say "First run on this device: setup - local paths"
   echo "(Saved to $CONFIG_FILE, which is gitignored. Delete it to re-configure.)"
   echo "Press Enter to accept the default shown in brackets."
   echo ""
@@ -173,50 +173,92 @@ if [[ -n "${WORKSPACE:-}" ]] && { [[ ! -d "$WORKSPACE/backend" ]] || [[ ! -d "$W
   echo "workspace links rebuilt -> $WORKSPACE"
 fi
 
-# --- 2. per-run configuration ----------------------------------------------
-say "STEP 2 of 3 - loop configuration"
-echo "Press Enter to accept the default shown in brackets."
-echo ""
-ask MAX_IT "Max review->revise iterations" "4"
-ask STRATEGY "Session strategy (fresh | chained)" "fresh"
-ask_yn DO_IMPL "Let claude IMPLEMENT after consensus" "n"
+# --- persisted loop configuration (edit by typing /config at the prompt) ----
+RUN_CONFIG_FILE="$SCRIPT_DIR/run-config.sh"
+[[ -f "$RUN_CONFIG_FILE" ]] && source "$RUN_CONFIG_FILE"
+MAX_IT="${MAX_IT:-4}"
+STRATEGY="${STRATEGY:-fresh}"
+DO_IMPL="${DO_IMPL:-n}"
+EXTRA_ARGS_RAW="${EXTRA_ARGS_RAW:-}"
 
-# The AGENTS decide which repos to implement (reviewer verdict's repos_touched,
-# or the confirmed understanding's REPOS AFFECTED). If a target repo sits on
-# main/master, the orchestrator exits blocked-on-branch (5) BEFORE editing
-# anything, and the resume loop below prompts you to create branches then.
-IMPL_ARGS=()
-[[ "$DO_IMPL" == "y" ]] && IMPL_ARGS=(--implement)
+run_config_prompts() {
+  say "Loop configuration (saved to run-config.sh; future runs use it automatically)"
+  echo "Press Enter to accept the default shown in brackets."
+  echo ""
+  ask MAX_IT "Max review->revise iterations" "${MAX_IT:-4}"
+  ask STRATEGY "Session strategy (fresh | chained)" "${STRATEGY:-fresh}"
+  ask_yn DO_IMPL "Let claude IMPLEMENT after consensus" "${DO_IMPL:-n}"
+  read -r -p "Additional orchestrator flags (optional, e.g. --max-retries 0) []: " __extra || true
+  EXTRA_ARGS_RAW="${__extra:-}"
+  cat > "$RUN_CONFIG_FILE" <<EOF
+# Loop configuration (gitignored). Re-run /config in countersign to edit.
+MAX_IT=$(printf '%q' "$MAX_IT")
+STRATEGY=$(printf '%q' "$STRATEGY")
+DO_IMPL=$(printf '%q' "$DO_IMPL")
+EXTRA_ARGS_RAW=$(printf '%q' "$EXTRA_ARGS_RAW")
+EOF
+  echo "Configuration saved."
+}
 
-# The rules file's presence IS the opt-in (rename/remove it to run without).
-RULES_ARGS=()
-if [[ -f "$SCRIPT_DIR/agent-review-rules.md" ]]; then
-  RULES_ARGS=(--review-rules "$SCRIPT_DIR/agent-review-rules.md")
-  echo "review invariants: built-in defaults + agent-review-rules.md"
+build_args() {
+  IMPL_ARGS=()
+  [[ "$DO_IMPL" == "y" ]] && IMPL_ARGS=(--implement)
+  RULES_ARGS=()
+  if [[ -f "$SCRIPT_DIR/agent-review-rules.md" ]]; then
+    RULES_ARGS=(--review-rules "$SCRIPT_DIR/agent-review-rules.md")
+  fi
+  CLI_ARGS=()
+  [[ -n "${ZCODE_CLI:-}" ]] && CLI_ARGS+=(--zcode-cli "$ZCODE_CLI")
+  [[ -n "${CLAUDE_CLI:-}" ]] && CLI_ARGS+=(--claude-cli "$CLAUDE_CLI")
+  EXTRA_ARGS=()
+  [[ -n "$EXTRA_ARGS_RAW" ]] && read -r -a EXTRA_ARGS <<< "$EXTRA_ARGS_RAW"
+  return 0   # guard: a short-circuited && as the last line would return 1 under set -e
+}
+
+show_config() {
+  say "Current configuration (type /config at the prompt below to change it)"
+  echo "  workspace : $WORKSPACE"
+  echo "  repos     : backend  = $BACKEND"
+  echo "               frontend = $FRONTEND"
+  echo "  loop      : max iterations $MAX_IT | strategy $STRATEGY | implement after consensus: $DO_IMPL"
+  local rules="built-in invariants"
+  [[ ${#RULES_ARGS[@]} -gt 0 ]] && rules="built-in + agent-review-rules.md"
+  echo "  review    : $rules"
+  [[ -n "$EXTRA_ARGS_RAW" ]] && echo "  extra     : $EXTRA_ARGS_RAW"
+  echo ""
+}
+
+# first run (or after deleting run-config.sh): collect loop config once
+if [[ ! -f "$RUN_CONFIG_FILE" ]]; then
+  run_config_prompts
 fi
 
-read -r -p "Additional orchestrator flags (optional, e.g. --max-retries 0): " EXTRA_ARGS_RAW || true
-EXTRA_ARGS=()
-[[ -n "$EXTRA_ARGS_RAW" ]] && read -r -a EXTRA_ARGS <<< "$EXTRA_ARGS_RAW"
-
-echo ""
-say "STEP 3 of 3 - YOUR TASK PROMPT: type what the agents should work on"
-echo "   This is the prompt that starts the collaboration."
-echo "   Finish with a blank line (press Enter twice). Ctrl+C cancels."
-TASK=""
+# --- the task prompt (with /config escape) -----------------------------------
+build_args
 while :; do
+  show_config
+  say "YOUR TASK PROMPT - type what the agents should work on"
+  echo "   Type /config (Enter) to change settings first."
+  echo "   Finish with a blank line (Enter on an empty line submits). Ctrl+C cancels."
+  TASK=""
   IFS= read -r line || break
-  if [[ -z "$line" && -n "$TASK" ]]; then break; fi
+  if [[ "$(printf '%s' "$line" | tr -d '[:space:]')" == "/config" ]]; then
+    run_config_prompts
+    build_args
+    continue
+  fi
   TASK+="$line"$'\n'
+  while :; do
+    IFS= read -r line || break
+    if [[ -z "$line" && -n "$TASK" ]]; then break; fi
+    TASK+="$line"$'\n'
+  done
+  if [[ -z "${TASK//[$' \t\n']/}" ]]; then
+    echo "Empty task prompt - aborting." >&2
+    exit 1
+  fi
+  break
 done
-if [[ -z "${TASK//[$' \t\n']/}" ]]; then
-  echo "Empty task prompt - aborting." >&2
-  exit 1
-fi
-
-CLI_ARGS=()
-[[ -n "${ZCODE_CLI:-}" ]] && CLI_ARGS+=(--zcode-cli "$ZCODE_CLI")
-[[ -n "${CLAUDE_CLI:-}" ]] && CLI_ARGS+=(--claude-cli "$CLAUDE_CLI")
 
 run_orch() { # extra args...
   "$PY" "$ORCH" "$TASK" \
