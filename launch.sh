@@ -142,44 +142,46 @@ ask_yn DO_IMPL "Let claude IMPLEMENT after consensus" "n"
 
 IMPL_REPO_ARGS=()
 if [[ "$DO_IMPL" == "y" ]]; then
-  BE_BRANCH=$(git -C "$BACKEND" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
-  FE_BRANCH=$(git -C "$FRONTEND" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  git_branch_of() { git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?"; }
+  select_impl_branch() { # select_impl_branch <repo-path> ; returns 1 to abort
+    local repo=$1 branch _cb NEW_BRANCH
+    branch=$(git_branch_of "$repo")
+    if [[ "$branch" == "?" ]]; then
+      echo "warning: could not read the git branch of $repo."
+      ask_yn _cb "Continue with this repo anyway (branch guard will be skipped)" "n"
+      [[ "$_cb" == "n" ]] && return 1
+    elif [[ "$branch" == "main" || "$branch" == "master" ]]; then
+      echo "$repo is on '$branch' - countersign does not implement on main/master."
+      ask NEW_BRANCH "New branch name to create and switch to" "agent/plan-impl"
+      git -C "$repo" checkout -b "$NEW_BRANCH" || { echo "Branch creation failed - aborting." >&2; return 1; }
+      echo "OK: $repo is now on new branch '$NEW_BRANCH'."
+    else
+      ask NEW_BRANCH "Branch for $repo: Enter = stay on '$branch', or type a NEW branch name" ""
+      if [[ -n "$NEW_BRANCH" ]]; then
+        git -C "$repo" checkout -b "$NEW_BRANCH" || { echo "Branch creation failed - aborting." >&2; return 1; }
+        echo "OK: $repo is now on new branch '$NEW_BRANCH'."
+      else
+        echo "$repo: implementation will run on branch '$branch' (uncommitted; you review and commit)."
+      fi
+    fi
+  }
+  BE_BRANCH=$(git_branch_of "$BACKEND")
+  FE_BRANCH=$(git_branch_of "$FRONTEND")
   echo "Which repo does this implementation target?"
   echo "  1) backend  ($BACKEND, branch: $BE_BRANCH)"
   echo "  2) frontend ($FRONTEND, branch: $FE_BRANCH)"
-  ask IMPL_CHOICE "Target (1/2)" "1"
+  echo "  3) BOTH repos - for tasks spanning backend and frontend (separate pass per repo)"
+  ask IMPL_CHOICE "Target (1/2/3)" "1"
   case "$IMPL_CHOICE" in
-    2) IMPL_REPO="$FRONTEND"; IMPL_BRANCH="$FE_BRANCH" ;;
-    *) IMPL_REPO="$BACKEND";  IMPL_BRANCH="$BE_BRANCH" ;;
+    3) IMPL_REPO_ARGS=(--implement-repo "$BACKEND" --implement-repo "$FRONTEND")
+       echo "Both repos selected: claude implements each repo's part of the plan in its own pass."
+       select_impl_branch "$BACKEND" || exit 1
+       select_impl_branch "$FRONTEND" || exit 1 ;;
+    2) IMPL_REPO_ARGS=(--implement-repo "$FRONTEND")
+       select_impl_branch "$FRONTEND" || exit 1 ;;
+    *) IMPL_REPO_ARGS=(--implement-repo "$BACKEND")
+       select_impl_branch "$BACKEND" || exit 1 ;;
   esac
-  IMPL_REPO_ARGS=(--implement-repo "$IMPL_REPO")
-
-  if [[ "$IMPL_BRANCH" == "?" ]]; then
-    echo "warning: could not read the git branch of the target repo."
-    ask_yn CONT_IMPL "Continue anyway (the branch guard will be skipped)" "n"
-    [[ "$CONT_IMPL" == "n" ]] && exit 1
-  elif [[ "$IMPL_BRANCH" == "main" || "$IMPL_BRANCH" == "master" ]]; then
-    echo "Target repo is on '$IMPL_BRANCH' - countersign does not implement on main/master."
-    ask NEW_BRANCH "New branch name to create and switch to" "agent/plan-impl"
-    if git -C "$IMPL_REPO" checkout -b "$NEW_BRANCH"; then
-      echo "OK: $IMPL_REPO is now on new branch '$NEW_BRANCH'."
-    else
-      echo "Branch creation failed - aborting." >&2
-      exit 1
-    fi
-  else
-    ask NEW_BRANCH "Branch: Enter = stay on '$IMPL_BRANCH', or type a NEW branch name to create" ""
-    if [[ -n "$NEW_BRANCH" ]]; then
-      if git -C "$IMPL_REPO" checkout -b "$NEW_BRANCH"; then
-        echo "OK: $IMPL_REPO is now on new branch '$NEW_BRANCH'."
-      else
-        echo "Branch creation failed - aborting." >&2
-        exit 1
-      fi
-    else
-      echo "Implementation will run on branch '$IMPL_BRANCH' in $IMPL_REPO (uncommitted; you review and commit)."
-    fi
-  fi
 fi
 
 RULES_ARGS=()

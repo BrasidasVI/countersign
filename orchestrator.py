@@ -507,14 +507,25 @@ def build_revise_prompt(plan_text: str, objections_json: str,
     return base
 
 
-def build_implement_prompt(plan_path: Path) -> str:
+def build_implement_prompt(plan_path: Path, target_repo: Path,
+                           all_targets: Optional[list] = None) -> str:
     # Absolute plan path: when --implement-repo is used, the implementation runs in
     # a different working directory than the one holding plan.md.
+    scope = ""
+    if all_targets and len(all_targets) > 1:
+        others = ", ".join(str(t) for t in all_targets if t != target_repo)
+        scope = (
+            f" This working directory ({target_repo}) is one of {len(all_targets)} "
+            f"repositories this plan spans; the others ({others}) are handled in "
+            "separate passes. Implement ONLY the parts of the plan that belong in "
+            "this repository; record any cross-repo contracts in "
+            "IMPLEMENTATION-NOTES.md rather than stubbing them."
+        )
     return (
         f"Implement the plan in {plan_path} in this repository now. Follow it "
         "exactly. Where the plan is ambiguous, choose the simplest option and "
         "record the decision in IMPLEMENTATION-NOTES.md. Run the tests the plan "
-        "specifies if the environment allows it."
+        "specifies if the environment allows it." + scope
     )
 
 
@@ -629,7 +640,7 @@ class Config:
     non_interactive: bool = False
     max_retries: int = 2
     retry_base_delay: int = 30
-    implement_repo: Optional[Path] = None
+    implement_repos: list = field(default_factory=list)
 
 
 def log(msg: str) -> None:
@@ -980,33 +991,39 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
     log(f"CONSENSUS reached after {iterations_used} iteration(s). Final plan: {cfg.plan_path}")
 
     if implement:
+        targets = cfg.implement_repos or [cfg.repo]
         if cfg.dry_run:
-            log("DRY-RUN implement pass (claude --permission-mode acceptEdits)")
+            for t in targets:
+                log(f"DRY-RUN implement pass for {t} (claude --permission-mode acceptEdits)")
         else:
             # Mechanical guard: prompt-level "target dev only" rules are advisory;
-            # this check is deterministic. Refuses to let the agent edit main/master.
-            # Guards the implementation target (--implement-repo when given, else
-            # the loop repo) - a multi-repo workspace root is not itself a git repo.
-            target_repo = cfg.implement_repo or cfg.repo
-            branch = _git_branch(target_repo)
-            if branch in ("main", "master"):
-                log(f"implement pass REFUSED: current branch is '{branch}' in {target_repo}. "
-                    "Create a feature branch first (e.g. git checkout -b agent/plan-impl).")
-                report.implement_refused = True
-                return EXIT_CONSENSUS
-            if branch is None:
-                log("note: not a git repo (or git unavailable); branch guard skipped")
-            log(f"implement pass: claude is editing {target_repo} (acceptEdits)")
-            report.implement_attempted = True
-            impl = call_claude(build_implement_prompt(cfg.plan_path), cwd=target_repo, cfg=cfg,
-                               session_id=None, permission_mode="acceptEdits")
-            accumulate(impl.usage, "claude")
-            if not impl.ok:
-                record_failure(impl, "implement pass failed", cfg, report)
-                return EXIT_ERROR
-            log(f"implement pass finished ({len(impl.text)} chars of final commentary)")
-            log("git steps are intentionally NOT automated; suggested:")
-            log('  git checkout -b agent/plan-impl && git add -A && git commit -m "implement plan (dual-agent consensus)"')
+            # this check is deterministic. Each target repo is guarded individually;
+            # a multi-repo workspace root is not itself a git repo.
+            for target_repo in targets:
+                branch = _git_branch(target_repo)
+                if branch in ("main", "master"):
+                    log(f"implement pass REFUSED for {target_repo}: on '{branch}'. "
+                        "Create a feature branch first (e.g. git checkout -b agent/plan-impl). "
+                        "Skipping this repo.")
+                    report.implement_refused = True
+                    continue
+                if branch is None:
+                    log(f"note: {target_repo} is not a git repo (or git unavailable); "
+                        "branch guard skipped")
+                log(f"implement pass: claude is editing {target_repo} on branch "
+                    f"'{branch}' (acceptEdits, changes stay UNCOMMITTED)")
+                report.implement_attempted = True
+                impl = call_claude(build_implement_prompt(cfg.plan_path, target_repo, targets),
+                                   cwd=target_repo, cfg=cfg,
+                                   session_id=None, permission_mode="acceptEdits")
+                accumulate(impl.usage, "claude")
+                if not impl.ok:
+                    record_failure(impl, f"implement pass failed for {target_repo}", cfg, report)
+                    return EXIT_ERROR
+                log(f"implement pass finished for {target_repo} "
+                    f"({len(impl.text)} chars of commentary); review with git diff and commit yourself")
+            log("git steps are intentionally NOT automated; per repo:")
+            log('  git add -A && git commit -m "implement plan (dual-agent consensus)"')
     return EXIT_CONSENSUS
 
 
@@ -1208,10 +1225,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--implement", action="store_true",
                    help="after consensus, let claude implement the plan (acceptEdits). "
                         "Git push is never automated.")
-    p.add_argument("--implement-repo", metavar="DIR",
+    p.add_argument("--implement-repo", metavar="DIR", action="append",
                    help="repository the implement pass edits when the loop workspace "
-                        "spans multiple repos (e.g. a dir containing separate frontend "
-                        "and backend repos); the branch guard applies to THIS repo")
+                        "spans multiple repos; REPEAT the flag for tasks spanning "
+                        "several repos - each gets its own branch-guarded pass "
+                        "scoped to its part of the plan")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECS,
                    help=f"per-call timeout in seconds (default {DEFAULT_TIMEOUT_SECS})")
     p.add_argument("--max-retries", type=int, default=2,
@@ -1251,10 +1269,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not repo.is_dir():
         print(f"error: --repo {repo} is not a directory", file=sys.stderr)
         return EXIT_ERROR
-    if args.implement_repo and not Path(args.implement_repo).resolve().is_dir():
-        print(f"error: --implement-repo {args.implement_repo} is not a directory",
-              file=sys.stderr)
-        return EXIT_ERROR
+    for r in args.implement_repo or []:
+        if not Path(r).resolve().is_dir():
+            print(f"error: --implement-repo {r} is not a directory", file=sys.stderr)
+            return EXIT_ERROR
 
     try:
         try:
@@ -1280,8 +1298,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             non_interactive=args.non_interactive,
             max_retries=max(0, args.max_retries),
             retry_base_delay=max(1, args.retry_base_delay),
-            implement_repo=(Path(args.implement_repo).resolve()
-                            if args.implement_repo else None),
+            implement_repos=([Path(r).resolve() for r in args.implement_repo]
+                             if args.implement_repo else []),
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
         log(f"reviewer: {' '.join(cfg.zcode_cmd)}")
