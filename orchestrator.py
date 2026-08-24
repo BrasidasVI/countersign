@@ -732,6 +732,7 @@ class RunReport:
     understanding_confirmed: bool = False
     repos_touched: list = field(default_factory=list)
     branch_blocked_repos: list = field(default_factory=list)
+    agent_models: dict = field(default_factory=dict)
 
 
 UNDERSTANDING_KEY = "Task understanding confirmed by the human"
@@ -1253,16 +1254,47 @@ def preflight(cfg: Config, report: RunReport) -> int:
         if not ver_ok:
             failures.append("claude launcher")
 
-        small = safe(call_claude, "Reply with exactly the word OK and nothing else.",
-                     cwd=probe_cwd, cfg=cfg, permission_mode="plan")
-        if small.ok and small.text.strip():
-            sid = "present" if small.session_id else "MISSING"
-            log(f"  small stdin prompt OK (result={small.text.strip()[:30]!r}, session_id={sid})")
-            if not small.session_id:
-                failures.append("claude json session_id")
+        small_err = ""
+        try:
+            small_proc = _run(cfg.claude_cmd + ["-p", "--output-format", "json"],
+                              timeout=cfg.timeout, cwd=probe_cwd, env_extra={},
+                              stdin_text="Reply with exactly the word OK and nothing else.")
+            small_ok = small_proc.returncode == 0
+        except OrchestratorError as e:
+            small_ok, small_proc, small_err = False, None, str(e)
+        if small_ok:
+            try:
+                data = json.loads(small_proc.stdout)
+            except ValueError:
+                data = {}
+            text = str(data.get("result", "")).strip()
+            sid = data.get("session_id")
+            model = data.get("model") or next(
+                (str(v) for k, v in data.items()
+                 if "model" in k.lower() and isinstance(v, str) and v), None)
+            if not model:
+                for sf in (Path.home() / ".claude" / "settings.json",
+                           Path.home() / ".claude" / "settings.local.json"):
+                    try:
+                        mv = json.loads(sf.read_text(encoding="utf-8")).get("model")
+                    except (OSError, ValueError):
+                        continue
+                    if mv:
+                        model = f"{mv} (default from {sf.name})"
+                        break
+            if text and sid:
+                log(f"  small stdin prompt OK (result={text[:30]!r}, session_id=present)")
+                report.agent_models["claude"] = (
+                    f"claude (model: {model})" if model else
+                    "claude (model: account default; pin with --model via /config)")
+                log(f"  {report.agent_models['claude']}")
+            else:
+                failures.append("claude json shape (result/session_id)")
+                log(f"  small stdin prompt OK but JSON shape unexpected "
+                    f"(keys: {', '.join(data.keys()) or 'none'})")
         else:
             failures.append("claude small stdin prompt (not logged in? try: claude)")
-            log(f"  small stdin prompt FAILED: {small.stderr[:200]}")
+            log(f"  small stdin prompt FAILED: {(small_err or (small_proc.stderr if small_proc else ''))[:200]}")
 
         big_payload = "lorem ipsum dolor sit amet " * 380  # ~10 KB
         big = safe(call_claude,
@@ -1287,6 +1319,47 @@ def preflight(cfg: Config, report: RunReport) -> int:
             log(f"  headless prompt OK (response={z.text.strip()[:30]!r}, sessionId={sid})")
             if not z.session_id:
                 failures.append("zcode sessionId")
+            # Ground truth for model/effort: this probe's own rollout record
+            try:
+                roll = Path.home() / ".zcode" / "cli" / "rollout"
+                rec = None
+                for f in sorted(roll.glob("model-io-*.jsonl"),
+                                key=lambda q: q.stat().st_mtime, reverse=True):
+                    for ln in reversed(f.read_text(encoding="utf-8").splitlines()):
+                        try:
+                            cand = json.loads(ln)
+                        except ValueError:
+                            continue
+                        if cand.get("sessionId") == z.session_id:
+                            rec = cand
+                            break
+                    if rec:
+                        break
+                if rec:
+                    m = rec.get("model", {}) or {}
+                    effort = ((rec.get("request", {}).get("body", {})
+                               .get("output_config", {})) or {}).get("effort")
+                    desc = str(m.get("modelId", "?"))
+                    if not effort:
+                        try:
+                            v2 = json.loads((Path.home() / ".zcode" / "v2" / "config.json")
+                                            .read_text(encoding="utf-8"))
+                            for prov in (v2.get("provider", {}) or {}).values():
+                                ment = (prov.get("models", {}) or {}).get(desc)
+                                if ment:
+                                    eff = ((ment.get("reasoning", {}) or {})
+                                           .get("defaultVariant"))
+                                    if eff:
+                                        effort = f"{eff} (model catalog default)"
+                                    break
+                        except (OSError, ValueError):
+                            pass
+                    if effort:
+                        desc += f" (reasoning effort: {effort})"
+                    report.agent_models["zcode"] = f"zcode {desc}"
+                    log(f"  model in use: {desc}")
+            except OSError:
+                pass
         else:
             failures.append("zcode headless prompt")
             log(f"  headless prompt FAILED: {z.stderr[:200]}")

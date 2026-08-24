@@ -230,11 +230,17 @@ build_args() {
   return 0   # guard: a short-circuited && as the last line would return 1 under set -e
 }
 
+python_model_fallback() {
+  "$PY" -c "import json,pathlib;p=pathlib.Path.home()/'.zcode/cli/config.json';print('zcode '+json.loads(p.read_text()).get('model',{}).get('main','(model unknown - run preflight)'))" 2>/dev/null || echo "zcode (model unknown)"
+}
+
 show_config() {
   say "Current configuration (type /config at the prompt below to change it)"
   echo "  workspace : $WORKSPACE"
   echo "  repos     : backend  = $BACKEND (branch: $(git_branch_of "$BACKEND"))"
   echo "               frontend = $FRONTEND (branch: $(git_branch_of "$FRONTEND"))"
+  echo "  agents    : drafter  = ${AGENT_DRAFTER:-claude (model: account default; pin with --model via /config)}"
+  echo "               reviewer = ${AGENT_REVIEWER:-$(python_model_fallback)}"
   echo "  loop      : max iterations $MAX_IT | strategy $STRATEGY | implement after consensus: $DO_IMPL"
   local rules="built-in invariants"
   [[ ${#RULES_ARGS[@]} -gt 0 ]] && rules="built-in + agent-review-rules.md"
@@ -286,8 +292,16 @@ run_orch() { # extra args...
 # --- 3. one-time preflight per device ---------------------------------------
 if [[ "${PREFLIGHT_DONE:-no}" != "yes" ]]; then
   say "First run on this device: running preflight (isolated temp dir, cheap calls)"
-  if "$PY" "$ORCH" --preflight x --repo "$WORKSPACE" "${CLI_ARGS[@]}"; then
+  PF_OUT=$("$PY" "$ORCH" --preflight x --repo "$WORKSPACE" "${CLI_ARGS[@]}" 2>/dev/null)
+  if [[ $? -eq 0 ]]; then
     sed -i.bak 's/^PREFLIGHT_DONE=.*/PREFLIGHT_DONE=yes/' "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+    # persist the detected agent models for the config summary
+    AGENT_DRAFTER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('claude',''))" 2>/dev/null)
+    AGENT_REVIEWER=$(printf '%s' "$PF_OUT" | "$PY" -c "import json,sys;r=json.load(sys.stdin);print(r.get('agent_models',{}).get('zcode',''))" 2>/dev/null)
+    [[ -n "$AGENT_DRAFTER" ]]  && printf 'AGENT_DRAFTER=%q
+'  "$AGENT_DRAFTER"  >> "$CONFIG_FILE"
+    [[ -n "$AGENT_REVIEWER" ]] && printf 'AGENT_REVIEWER=%q
+' "$AGENT_REVIEWER" >> "$CONFIG_FILE"
     say "Preflight OK - will not run again on this device (delete $CONFIG_FILE to redo)"
   else
     ask_yn CONT "Preflight FAILED - run the loop anyway" "n"
