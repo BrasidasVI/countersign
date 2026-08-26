@@ -216,14 +216,20 @@ def build_workspace(repo_paths: list[Path]) -> Path:
                     ["powershell", "-NoProfile", "-Command", ps],
                     capture_output=True, text=True, timeout=60)
             except (subprocess.TimeoutExpired, OSError) as e:
-                raise OrchestratorError(f"could not create junction {link} -> {rp}: {e}")
-            if proc.returncode != 0:
+                if link.exists() and link.is_dir():
+                    pass            # lost a creation race with a concurrent run; link is healthy
+                else:
+                    raise OrchestratorError(f"could not create junction {link} -> {rp}: {e}")
+            if proc.returncode != 0 and not (link.exists() and link.is_dir()):
                 raise OrchestratorError(
                     f"could not create junction {link} -> {rp}: "
                     f"{(proc.stderr or '').strip()[:200]}")
         else:
             try:
                 os.symlink(rp, link)
+            except FileExistsError:
+                if not link.is_dir():
+                    raise OrchestratorError(f"could not create symlink {link} -> {rp}")
             except OSError as e:
                 raise OrchestratorError(f"could not create symlink {link} -> {rp}: {e}")
     return ws
@@ -783,6 +789,29 @@ def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) 
         report.outcome = "error"
         report.error = f"{what}: {res.stderr or 'empty response'}"
         log(f"ERROR {report.error}")
+
+
+def acquire_plan_lock(history_dir: Path) -> Optional[Path]:
+    """One engine run per plan at a time: the plan is revised IN PLACE and the
+    history dir is shared, so two concurrent loops on the same plan would
+    interleave revisions and clobber each other's iteration records. Returns
+    the lock path on success, None when another run holds it. Locks older than
+    12h are treated as stale (crashed run) and taken over."""
+    lock = history_dir / "run.lock"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if lock.exists():
+            age = time.time() - lock.stat().st_mtime
+            if age < 12 * 3600:
+                return None
+            log(f"plan lock is {int(age // 3600)}h old - taking over (stale run?)")
+            lock.unlink()
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}")
+        return lock
+    except FileExistsError:
+        return None
 
 
 def log_usage_estimate(cfg: Config, implement: bool) -> None:
@@ -1448,7 +1477,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             if args.preflight:
                 return preflight(cfg, report)
-            return run_loop(cfg, args.implement, report)
+            plan_lock = acquire_plan_lock(cfg.history_dir) if not cfg.dry_run else "dry-run"
+            if plan_lock is None:
+                report.outcome = "locked"
+                report.error = (
+                    f"another countersign run is already working on {cfg.plan_path} "
+                    f"(lock: {cfg.history_dir / 'run.lock'}). Concurrent loops on the "
+                    "same plan would corrupt each other's revisions - wait for it to "
+                    "finish, or delete the lock file if that run crashed.")
+                log(f"ERROR {report.error}")
+                return EXIT_ERROR
+            try:
+                return run_loop(cfg, args.implement, report)
+            finally:
+                if plan_lock != "dry-run":
+                    Path(plan_lock).unlink(missing_ok=True)
         except KeyboardInterrupt:
             report.outcome = "interrupted"
             raise

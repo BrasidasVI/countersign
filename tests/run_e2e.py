@@ -153,6 +153,19 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     rj = json.loads((Path(rep["history_dir"]) / "review-iter-01.json").read_text(encoding="utf-8"))
     check("raw verdict persisted", "raw" in rj and rj["raw"].startswith("{"))
 
+    print("scenario F: second concurrent run on the same plan is refused")
+    planF = make_plan(repoA, "plan-f.md", "# Plan F\n\nGoal: stub goal.\n")
+    histF = planA.parent / ".countersign" / "plan-f-history"
+    histF.mkdir(parents=True, exist_ok=True)
+    (histF / "run.lock").write_text("pid=99999 started=fake\n", encoding="utf-8")
+    rc, rep, err = run_engine(planF, [repoA, repoB], stub_mode="approve")
+    check("exit code 2", rc == 2, f"rc={rc}")
+    check("outcome locked", rep and rep.get("outcome") == "locked", str(rep)[:120])
+    (histF / "run.lock").unlink()
+    rc, rep, err = run_engine(planF, [repoA, repoB], stub_mode="approve")
+    check("runs again once lock cleared", rc == 0 and rep.get("outcome") == "consensus")
+    check("lock released after run", not (histF / "run.lock").exists())
+
     # junction workspace must expose ONLY the linked repos
     ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")

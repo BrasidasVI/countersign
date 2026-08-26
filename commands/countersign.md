@@ -39,9 +39,10 @@ user which planning document to review before doing anything else.
 ## Step 3 - write the context brief
 
 This is how the headless agents inherit THIS conversation's context cheaply.
-Write `<plan-dir>/.countersign/context-brief.md` (create the `.countersign`
-dir). Keep it under ~40 lines. It must capture, from this conversation and
-the plan itself:
+Write `<plan-dir>/.countersign/<plan-stem>-context-brief.md` (create the
+`.countersign` dir; the per-plan name keeps concurrent runs on sibling plans
+from overwriting each other). Keep it under ~40 lines. It must capture, from
+this conversation and the plan itself:
 
 - INTENT: what problem this plan addresses and why now
 - CONSTRAINTS: technical constraints, existing decisions, things that must
@@ -62,7 +63,7 @@ Build and run with Bash (adjust flags from the parsed arguments):
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
   $(printf -- '--link-repo %q ' "${REPOS[@]}") \
-  --context-brief "<plan-dir>/.countersign/context-brief.md" \
+  --context-brief "<plan-dir>/.countersign/<plan-stem>-context-brief.md" \
   [--decisions "<decisions file>" (only when resuming after answers)] \
   [--implement] \
   [--strategy chained --fork-current-session (only when --fork given)] \
@@ -101,6 +102,9 @@ Parse the last stdout line as JSON and branch on `outcome`:
   run's state is persisted (plan snapshots + reviews in `history_dir`), so
   re-running later continues rather than re-spending earlier iterations.
   Stop; do not retry automatically.
+- **locked** - Another countersign run is already working on this same plan
+  (check for a background task in this or another session). Tell the user;
+  do not delete the lock unless they confirm the other run is dead.
 - **no-consensus** - Show the remaining blocking objections from the report
   verbatim. Offer the user the real options: raise `--iterations`, revise
   the plan together in-chat first, or accept the disagreement and stop.
