@@ -843,6 +843,7 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
 
     for i in range(1, cfg.max_iterations + 1):
         iterations_used = i
+        report.iterations_used = i   # early returns (blocked-on-human, errors) keep the count
         log(f"iteration {i}/{cfg.max_iterations}: reviewer (zcode) examining {cfg.plan_path.name}")
         review = reviewer(build_review_prompt(cfg.plan_path.name, cfg.review_rules,
                                               cfg.brief_text, settled), cfg,
