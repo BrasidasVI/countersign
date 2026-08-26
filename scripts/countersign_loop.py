@@ -793,6 +793,7 @@ class RunReport:
     plan_sha256: str = ""
     plan_branch: Optional[str] = None
     plan_commit: Optional[str] = None
+    warnings: list = field(default_factory=list)
 
 
 def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) -> None:
@@ -821,6 +822,62 @@ def _git_context(path: Path) -> "tuple[Optional[str], Optional[str]]":
         return branch, commit
     except (subprocess.TimeoutExpired, OSError):
         return None, None
+
+
+def _git_repo_root(p: Path) -> Optional[Path]:
+    try:
+        r = subprocess.run(["git", "-C", str(p), "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=15)
+        return Path(r.stdout.strip()) if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _git_identity(p: Path) -> Optional[str]:
+    """Stable identity of the repo at p, shared across its worktrees.
+
+    --git-common-dir is the same absolute path for every worktree of one
+    repository, so a worktree checks out as 'the same repo' as its main
+    checkout - which is exactly the case where a plan written in one and
+    reviewed against the other can silently disagree."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(p), "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return str(Path(r.stdout.strip()).resolve()).lower().replace("\\", "/")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def check_plan_repo_consistency(plan_path: Path, link_repos: list) -> list:
+    """Warn when the plan's repo is the SAME repository as a linked repo but a
+    DIFFERENT checkout (e.g. plan read from a worktree based on an old commit
+    while the agents review the real checkout on another branch). Content can
+    match while the surrounding code differs - the review would then judge the
+    plan against code it wasn't written against. Returns warning strings."""
+    warnings = []
+    plan_root = _git_repo_root(plan_path.parent)
+    if plan_root is None or not link_repos:
+        return warnings
+    plan_ident = _git_identity(plan_root)
+    _, plan_commit = _git_context(plan_root)
+    for lr in link_repos:
+        lroot = _git_repo_root(Path(lr))
+        if lroot is None or lroot.resolve() == plan_root.resolve():
+            continue
+        if plan_ident and _git_identity(lroot) == plan_ident:
+            _, lcommit = _git_context(lroot)
+            if lcommit != plan_commit:
+                w = (f"plan repo checkout mismatch: the plan lives in "
+                     f"{plan_root} (commit {plan_commit}) but the agents will "
+                     f"review {lroot} (commit {lcommit}) - same repository, "
+                     "different checkouts (worktree?). The review may judge the "
+                     "plan against code it was not written against.")
+                warnings.append(w)
+    return warnings
 
 
 def acquire_plan_lock(history_dir: Path) -> Optional[Path]:
@@ -1542,6 +1599,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"plan sha256={report.plan_sha256[:12]}... (no --expect-sha256 given - "
                     "pass it to guard against stale/wrong-branch reviews)")
                 log(f"plan repo: branch={report.plan_branch} commit={report.plan_commit}")
+                for w in check_plan_repo_consistency(
+                        plan_path, [Path(r) for r in args.link_repo]):
+                    report.warnings.append(w)
+                    log(f"WARNING: {w}")
             if args.preflight:
                 return preflight(cfg, report)
             plan_lock = acquire_plan_lock(cfg.history_dir) if not cfg.dry_run else "dry-run"

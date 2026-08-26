@@ -188,6 +188,33 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("hash + git context in report",
           rep.get("plan_sha256") == good and rep.get("plan_branch") in ("main", "dev", "feature/stub"))
 
+    print("scenario H: plan in a stale worktree of a linked repo warns")
+    import subprocess as _sp
+    wh = T / "wh-main"
+    wh.mkdir()
+    _sp.run(["git", "init", "-q", "-b", "dev"], cwd=wh, check=True, capture_output=True)
+    (wh / "p.md").write_text("# v1\n", encoding="utf-8")
+    (wh / "README.md").write_text("x\n", encoding="utf-8")
+    _sp.run(["git", "add", "-A"], cwd=wh, check=True, capture_output=True)
+    _sp.run(["git", "-c", "user.email=s@t", "-c", "user.name=t", "commit", "-q", "-m", "v1"],
+            cwd=wh, check=True, capture_output=True)
+    (wh / "p.md").write_text("# v2 with more content\n", encoding="utf-8")
+    _sp.run(["git", "-c", "user.email=s@t", "-c", "user.name=t", "commit", "-q", "-am", "v2"],
+            cwd=wh, check=True, capture_output=True)
+    wt = T / "wh-old"
+    _sp.run(["git", "-C", str(wh), "worktree", "add", "-q", "--detach", str(wt), "HEAD~1"],
+            check=True, capture_output=True)
+    stale_plan = wt / "p.md"                       # v1, content INTENTIONALLY matches the hash guard
+    import hashlib as _h2
+    good = _h2.sha256(stale_plan.read_bytes()).hexdigest()
+    rc, rep, err = run_engine(stale_plan, [wh, repoB],
+                              extra=["--expect-sha256", good], stub_mode="approve")
+    check("runs (warning, not block)", rc == 0 and rep.get("outcome") == "consensus",
+          f"rc={rc}")
+    check("worktree mismatch warned",
+          any("different checkouts" in w for w in rep.get("warnings", [])),
+          str(rep.get("warnings"))[:160])
+
     # junction workspace must expose ONLY the linked repos
     ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")

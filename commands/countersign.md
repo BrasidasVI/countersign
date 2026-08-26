@@ -93,7 +93,8 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
 
 ## Step 5 - mediate the outcome
 
-Parse the last stdout line as JSON and branch on `outcome`:
+Parse the last stdout line as JSON, surface any `warnings` in the report
+verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
 
 - **consensus** - Read the final plan. Tell the user three things: (1) what
   changed between the first reviewed draft and the final plan (the
