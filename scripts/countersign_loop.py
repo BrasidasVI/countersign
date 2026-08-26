@@ -1,110 +1,54 @@
 #!/usr/bin/env python3
-"""
-orchestrator.py — dual-agent consensus loop: Claude Code drafts, ZCode (GLM) reviews.
+"""countersign_loop - the dual-agent consensus engine behind the /countersign
+Claude Code plugin.
 
-Verified invocations (ZCode 0.16.3, Windows, live-tested):
-  node zcode.cjs --prompt "..." --attach <file> --json --mode plan --no-color [--resume <sid>]
-    -> stdout: single JSON object {sessionId, response, usage, projection}; exit 0 on success.
+Role division:
+  - The INTERACTIVE Claude Code session (the human's chat) is the drafter of
+    record: it holds the conversation context and owns the plan document.
+  - This engine runs the consensus loop headlessly: ZCode (GLM) reviews the
+    plan; a headless claude session applies each revision round; repeat until
+    the reviewer approves or --max-iterations is hit.
+  - The plugin command (commands/countersign.md) is the glue: it tells the
+    interactive Claude how to prepare inputs (plan file + context brief) and
+    how to mediate this engine's exit states back into the conversation.
 
-Claude side (ASSUMPTIONS — resolve empirically with `--preflight` on a machine that
-has the claude CLI installed and logged in):
-  - prompt is delivered via stdin (`claude -p --output-format json` with no positional)
-  - stdout JSON contains at least {result, session_id}
-  - the launcher may be claude.exe or a claude.cmd shim; whichever shutil.which finds
-    must be launchable via subprocess (preflight proves it by actually launching it)
+Input contract: the plan document ALREADY EXISTS on disk (the interactive
+session wrote it). This engine never drafts from scratch.
 
-Flow:
-  0. understanding confirmation: the drafter restates the task as a structured
-     understanding (type, intent, desired outcome, out-of-scope, repos, success
-     criteria); on an interactive terminal the human confirms y/n, clarifying
-     until confirmed. Non-interactive runs record the (unconfirmed) statement.
-     The confirmed understanding is a settled decision: it anchors the seed
-     prompt AND the review prompt (the reviewer checks plan fidelity to the
-     confirmed intent, not just internal soundness), and is skipped on resume.
-  1. drafter (Claude Code) writes plan v1 from the seed idea          [read-only pass]
-  2. reviewer (ZCode) reviews plan.md via --attach, read-only         [--mode plan],
-     judged against REQUIRED INVARIANTS (see DEFAULT_REVIEW_RULES / --review-rules)
-       approve + zero blocking objections + zero open questions -> consensus, stop
-       objections (technical plan flaws)                         -> drafter revises, loop
-       open_questions (product/company-direction decisions)      -> HUMAN RESOLUTION
-       fyi_notes (awareness-only observations)                   -> logged + summarized;
-                                                                     never blocks or asks
-  3. human resolution phase: open questions are settled by the human — inline
-     prompts on an interactive terminal, or pre-answered via --decisions FILE
-     (the format of the open-questions.json this script writes). Anything left
-     unresolved is written to open-questions.json and the run exits
-     blocked-on-human (code 4): fill in the answers, re-run with --decisions.
-     Settled decisions are authoritative: the drafter must incorporate them and
-     the reviewer must not re-open them in later iterations. Re-runs with
-     --decisions RESUME: if the plan file already exists, the seed pass is skipped
-     and the existing plan is reviewed directly, so settled ground is never
-     re-drafted (delete the plan or change --plan-out to force a fresh draft).
-  4. hard cap at --max-iterations (no agent-side turn cap available: zcode's
-     --max-turns flag is listed in --help but rejected by the 0.16.3 parser)
-  5. optional --implement pass (claude, acceptEdits). REFUSES to run on main/master.
-     Never runs git push — pushing stays with the human.
+Invocation (what the plugin command runs):
+  python countersign_loop.py PLAN.md \
+      --link-repo <backend> --link-repo <frontend> \
+      [--context-brief brief.md] [--decisions decisions.json] \
+      [--fork-session-id <sid>] [--implement] [--max-iterations N] ...
 
-Session strategy (test both; see discussion with the other reviewer):
-  fresh   (default) every call starts a new session; orchestrator passes the current
-          plan + objections explicitly. No anchoring on rejected drafts.
-  chained reviewer and drafter each reuse one session across iterations via --resume;
-          context accumulates (cheaper via prompt caching, but risks drift).
+Output contract (stable, machine-read by the plugin command):
+  - stdout: exactly ONE compact JSON line, the RunReport, on every exit path.
+  - stderr: human-readable progress logs (also streamed to the chat).
+  - exit codes: 0 consensus | 2 error/rate-limited | 3 no-consensus |
+    4 blocked-on-human (questions need answers -> --decisions) |
+    5 blocked-on-branch (implement target on main/master; nothing edited).
 
-Output contract (CI-gatable):
-  Human-readable logs go to stderr. stdout carries exactly ONE line: a compact JSON
-  object emitted on every exit path (consensus, no-consensus, blocked-on-human,
-  error, interrupt, preflight), e.g.
-    {"outcome":"no-consensus","iterations_used":4,"blocking_remaining":[...],...}
-  Exit codes: 0 consensus | 2 error | 3 no-consensus | 4 blocked-on-human.
-  so pipelines can gate on `python orchestrator.py ... | jq -e .outcome`.
+Human-in-the-loop surfaces (all mediated by the interactive session):
+  - Open questions (product/company decisions): the loop STOPS, exit 4,
+    questions land in <history>/open-questions.json; the chat collects the
+    human's answers, writes decisions.json, re-runs with --decisions.
+  - Branch safety: implement passes refuse main/master before any edit.
+  - Git: nothing is ever committed or pushed by this engine.
 
-Rate limits & usage accounting (5h/weekly coding-plan windows):
-  Neither provider exposes REMAINING quota to headless CLIs (z.ai responses carry
-  no x-ratelimit-* headers; Claude Pro exposes nothing headless), so the
-  orchestrator accounts for CONSUMPTION instead: a pre-run token estimate is
-  logged (zcode basis measured live, claude basis assumed until run one), and
-  exact per-agent totals land in the stdout JSON ("usage") and run-summary.json.
-  Failed calls are matched against both providers' quota-error taxonomies
-  (429 / insufficient_quota / exceeded_current_quota_error / "usage limit ...
-  resets at" ...) and retried with exponential backoff (--max-retries, default 2,
-  --retry-base-delay, default 30s). A spent plan window will not clear within
-  backoff: the run then exits with outcome "rate-limited" (still exit code 2)
-  and an error saying to re-run after the window resets. Lifetime consumption
-  can be audited in ~/.zcode/cli/rollout/*.jsonl (per-request token usage).
-
-v2 design notes (agreed with the reviewing agent, NOT implemented in v1):
-
-  Post-implementation review pass
-    After consensus -> implement, run a second reviewer pass before human testing.
-    Shape: `git diff HEAD` (or diff against the pre-implementation commit) written
-    to a temp file; reviewer called with --attach <diff> AND --attach plan.md, with
-    the prompt adjusted to "review this implementation diff for fidelity to the
-    attached plan" rather than "review this plan for soundness".
-    Same three-channel verdict:
-      objections     - implementation diverges from plan (blocking) or minor slippage
-      fyi_notes      - gray-zone deviations worth human awareness (e.g. a
-                       simplification the drafter made that changes a non-critical
-                       detail)
-      open_questions - must NOT appear in an implementation review; if the reviewer
-                       raises one, the drafter silently resolved a product decision
-                       during implementation. Treat it as a blocking objection and
-                       surface it to the human before testing.
-    Exit paths:
-      approved            -> human tests (existing flow)
-      blocking objections -> optionally loop back to the implement pass with the
-                             objections attached (bounded by a separate
-                             --impl-max-iterations, default 2); or exit to the human
-      open_questions      -> always exit to the human; never auto-loop
-    Mechanically reuses call_zcode / parse_verdict / fyi_notes with no new protocol;
-    the only new surface is git diff capture and a second --attach argument.
-    Not in v1 because the drafter (claude) side is not yet live-tested: validate
-    seed -> review -> implement first, and add this once --implement is proven on
-    a real feature.
+Usage limits (Claude Pro / z.ai 5h+weekly windows):
+  - per-call rate/quota detection with exponential backoff (--max-retries);
+    an un-clearable limit exits outcome="rate-limited" with the run's state
+    persisted (plan snapshots + sessions in <history>) so a later re-run
+    continues rather than re-spending earlier iterations.
+  - a pre-run cost estimate is logged; per-agent token totals are reported.
+  - --fork-session-id re-sends the forked conversation's full context on
+    EVERY revise call - opt in per run, it multiplies claude-side cost.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -142,7 +86,7 @@ class OrchestratorError(RuntimeError):
 def resolve_zcode_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     """Return the command prefix that launches the ZCode CLI, e.g. [node, zcode.cjs]."""
     if explicit:
-        return _node_prefix(explicit)
+        return _zcode_explicit_cmd(explicit)
     here = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     candidates = [
         Path(here) / "Programs" / "ZCode" / "resources" / "glm" / "zcode.cjs",
@@ -170,8 +114,20 @@ def _node_prefix(cjs_path: str) -> list[str]:
     return [node, cjs_path]
 
 
+def _zcode_explicit_cmd(explicit: str) -> list[str]:
+    # A .cjs bundle needs node; a .py needs this interpreter (keeps stub-agent
+    # testing free of cmd.exe wrapper quoting); anything else runs as-is.
+    if explicit.lower().endswith(".cjs"):
+        return _node_prefix(explicit)
+    if explicit.lower().endswith(".py"):
+        return [sys.executable, explicit]
+    return [explicit]
+
+
 def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     if explicit:
+        if explicit.lower().endswith(".py"):
+            return [sys.executable, explicit]
         return [explicit]
     found = shutil.which("claude")
     # The Windows installer may ship a .cmd shim, a .exe, or both. Either launches
@@ -214,6 +170,88 @@ def zcode_api_key() -> Optional[str]:
     except (OSError, ValueError):
         pass
     return None
+
+
+# --------------------------------------------------------------------------
+# Synthetic workspace (both repos visible, nothing else granted)
+# --------------------------------------------------------------------------
+
+def _remove_link(link: Path) -> None:
+    """Remove a junction/symlink WITHOUT touching its target's contents.
+    shutil.rmtree must never be used here: on Windows it follows junctions."""
+    try:
+        os.lstat(link)          # raises FileNotFoundError if nothing is there
+    except OSError:
+        return
+    if link.is_symlink() or link.is_file():
+        link.unlink()
+    else:
+        os.rmdir(link)          # junction / dir-symlink: removes the link only
+
+
+def build_workspace(repo_paths: list[Path]) -> Path:
+    """Build (or reuse) ~/.countersign/ws/<hash>/ containing a link to each repo.
+
+    Pure Python on POSIX (symlinks); PowerShell junctions on Windows (junctions
+    need no developer mode and no admin). Agents run with cwd = this workspace,
+    so they see exactly the linked repos and nothing else beside them.
+    """
+    resolved = [p.resolve() for p in repo_paths]
+    for p in resolved:
+        if not p.is_dir():
+            raise OrchestratorError(f"--link-repo {p} is not a directory")
+    key = hashlib.md5("|".join(sorted(str(p) for p in resolved)).encode()).hexdigest()[:10]
+    ws = Path.home() / ".countersign" / "ws" / key
+    ws.mkdir(parents=True, exist_ok=True)
+    for rp in resolved:
+        link = ws / rp.name
+        if link.exists() and link.is_dir():
+            continue            # healthy link already in place
+        _remove_link(link)      # dangling/damaged link: drop and recreate
+        if os.name == "nt":
+            ps = ("New-Item -ItemType Junction -Path "
+                  f"'{str(link)}' -Target '{str(rp)}' | Out-Null")
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True, text=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                raise OrchestratorError(f"could not create junction {link} -> {rp}: {e}")
+            if proc.returncode != 0:
+                raise OrchestratorError(
+                    f"could not create junction {link} -> {rp}: "
+                    f"{(proc.stderr or '').strip()[:200]}")
+        else:
+            try:
+                os.symlink(rp, link)
+            except OSError as e:
+                raise OrchestratorError(f"could not create symlink {link} -> {rp}: {e}")
+    return ws
+
+
+def discover_current_claude_session(cwd: Path) -> Optional[str]:
+    """Best-effort session ID of the CURRENT interactive Claude Code session.
+
+    Claude Code stores one transcript per session at
+    ~/.claude/projects/<cwd with non-alphanumerics as '-'>/<session-uuid>.jsonl;
+    the live session's transcript is the most recently modified one. Used by
+    --fork-current-session so the headless revise sessions can fork this
+    conversation's context. Returns None when nothing plausible is found."""
+    root = Path.home() / ".claude" / "projects"
+    encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd))
+    proj = root / encoded
+    if not proj.is_dir():
+        return None
+    try:
+        newest = max(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    except ValueError:
+        return None
+    try:
+        first = newest.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        sid = json.loads(first).get("sessionId")
+        return str(sid) if sid else None
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -316,8 +354,8 @@ def _invoke_with_retries(fn, *, cfg, label: str) -> AgentResult:
 def _run(cmd: list[str], *, timeout: int, cwd: Path, env_extra: dict, stdin_text: str = "") -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.update(env_extra)
-    # Heartbeat: a long model call (drafting, reviews, implement passes) can run
-    # for minutes with the parent silent; periodic progress lines make a live
+    # Heartbeat: a long model call (reviews, revise passes, implement passes) can
+    # run for minutes with the parent silent; periodic progress lines make a live
     # run distinguishable from a hung one.
     label = _preview_cmd(cmd)
     beat_secs = max(5, HEARTBEAT_SECS)
@@ -386,21 +424,26 @@ def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = No
 
 
 def call_claude(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] = None,
-                permission_mode: str = "plan") -> AgentResult:
+                permission_mode: str = "plan", fork: bool = False) -> AgentResult:
     return _invoke_with_retries(
         lambda: _call_claude_once(prompt, cwd=cwd, cfg=cfg, session_id=session_id,
-                                  permission_mode=permission_mode),
+                                  permission_mode=permission_mode, fork=fork),
         cfg=cfg, label="claude")
 
 
 def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] = None,
-                      permission_mode: str = "plan") -> AgentResult:
+                      permission_mode: str = "plan", fork: bool = False) -> AgentResult:
     # Prompt goes via stdin: plan documents can exceed Windows argv limits.
     cmd = cfg.claude_cmd + ["-p", "--output-format", "json"]
     if permission_mode:
         cmd += ["--permission-mode", permission_mode]
     if session_id:
         cmd += ["--resume", session_id]
+        if fork:
+            # Branch the resumed session instead of appending to it: lets revise
+            # calls inherit an interactive conversation's context without ever
+            # touching the live session. Available since Claude Code 2.1.x.
+            cmd += ["--fork-session"]
     proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra={}, stdin_text=prompt)
     if proc.returncode != 0:
         return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
@@ -425,7 +468,14 @@ def _preview_cmd(cmd: list[str]) -> str:
 # Consensus protocol
 # --------------------------------------------------------------------------
 
-def build_review_prompt(plan_name: str, rules_text: str, settled: Optional[dict] = None) -> str:
+def _brief_section(brief_text: str) -> str:
+    return ("\n=== HUMAN CONTEXT BRIEF (written by the interactive session; "
+            "authoritative intent, constraints, and in-chat decisions) ===\n"
+            + brief_text.strip() + "\n=== END CONTEXT BRIEF ===\n")
+
+
+def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
+                        settled: Optional[dict] = None) -> str:
     # Prompt shape validated live against ZCode 0.16.3; the invariant block and the
     # open_questions channel were added after live testing showed plans passing with
     # unchallenged rollout risks and silently-made product decisions.
@@ -467,6 +517,8 @@ def build_review_prompt(plan_name: str, rules_text: str, settled: Optional[dict]
         '"revise" with the violation reported as a BLOCKING objection:\n'
         f"{rules_text}"
     )
+    if brief_text:
+        base += "\n" + _brief_section(brief_text)
     if settled:
         base += (
             "\nSettled human decisions (authoritative; do NOT re-open these, re-ask "
@@ -476,37 +528,7 @@ def build_review_prompt(plan_name: str, rules_text: str, settled: Optional[dict]
     return base
 
 
-def build_seed_prompt(idea: str, repo: Path, understanding: Optional[str] = None,
-                      confirmed: bool = False) -> str:
-    base = (
-        "Produce a complete implementation plan document for the idea below. "
-        f"The working repository is: {repo}\n"
-        "\n"
-        f"IDEA: {idea}\n"
-        "\n"
-        "The plan must include these sections: Goal; Non-goals; Pre-implementation "
-        "verification steps (what to confirm in the repo before coding); File-level "
-        "changes; Risks and mitigations; Test strategy; Rollout steps.\n"
-        "\n"
-        "Product and company-direction decisions (pricing, target users, scope "
-        "boundaries, roadmap priorities, public commitments, vendor or cost "
-        "commitments, legal or compliance posture) belong to the human. Do NOT "
-        "decide them silently: if any are needed, end the plan with a section "
-        "'## Open questions' listing each with context, realistic options, and your "
-        "recommendation. Ordinary technical choices are yours - decide them and "
-        "note the decision inline.\n"
-        "Output only the plan document (markdown), no surrounding commentary."
-    )
-    if understanding:
-        label = ("HUMAN-CONFIRMED TASK UNDERSTANDING (authoritative; the plan must "
-                 "satisfy this exactly)" if confirmed else
-                 "DRAFTER'S UNCONFIRMED UNDERSTANDING (no terminal available to "
-                 "confirm it; plan against it but flag any doubts as open questions)")
-        base += ("\n=== " + label + " ===\n" + understanding + "\n=== END UNDERSTANDING ===\n")
-    return base
-
-
-def build_revise_prompt(plan_text: str, objections_json: str,
+def build_revise_prompt(plan_text: str, objections_json: str, brief_text: str = "",
                         settled: Optional[dict] = None) -> str:
     base = (
         "You are the drafting agent in a two-agent consensus workflow. A reviewer "
@@ -522,6 +544,8 @@ def build_revise_prompt(plan_text: str, objections_json: str,
         "objection and as many minor ones as is reasonable. Output only the revised "
         "plan document itself, no commentary."
     )
+    if brief_text:
+        base += "\n" + _brief_section(brief_text)
     if settled:
         base += (
             "\n=== HUMAN DECISIONS (settled by the product owner; treat as final "
@@ -535,8 +559,8 @@ def build_revise_prompt(plan_text: str, objections_json: str,
 
 def build_implement_prompt(plan_path: Path, target_repo: Path,
                            all_targets: Optional[list] = None) -> str:
-    # Absolute plan path: when --implement-repo is used, the implementation runs in
-    # a different working directory than the one holding plan.md.
+    # Absolute plan path: the implementation runs in a different working directory
+    # (the workspace) than the one holding the real plan document.
     scope = ""
     if all_targets and len(all_targets) > 1:
         others = ", ".join(str(t) for t in all_targets if t != target_repo)
@@ -668,8 +692,9 @@ class Config:
     strategy: str          # "fresh" | "chained"
     dry_run: bool
     review_rules: str = ""
+    brief_text: str = ""
     decisions_file: Optional[str] = None
-    non_interactive: bool = False
+    fork_session_id: Optional[str] = None
     max_retries: int = 2
     retry_base_delay: int = 30
     implement_repos: list = field(default_factory=list)
@@ -688,12 +713,14 @@ def snapshot(path: Path, dest_dir: Path, name: str) -> None:
     (dest_dir / name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def drafter(prompt: str, cfg: Config, session: Optional[str], mode: str) -> AgentResult:
+def drafter(prompt: str, cfg: Config, session: Optional[str], mode: str,
+            fork: bool = False) -> AgentResult:
     if cfg.dry_run:
-        log(f"DRY-RUN claude (mode={mode}, resume={'yes' if session else 'no'}): "
-            f"{prompt[:120].replace(chr(10), ' ')}...")
-        return AgentResult(ok=True, text="<dry-run plan document>", session_id="dry-run")
-    return call_claude(prompt, cwd=cfg.repo, cfg=cfg, session_id=session, permission_mode=mode)
+        log(f"DRY-RUN claude (mode={mode}, resume={'yes' if session else 'no'}, "
+            f"fork={'yes' if fork else 'no'}): {prompt[:120].replace(chr(10), ' ')}...")
+        return AgentResult(ok=True, text="<dry-run revised plan>", session_id="dry-run")
+    return call_claude(prompt, cwd=cfg.repo, cfg=cfg, session_id=session,
+                       permission_mode=mode, fork=fork)
 
 
 def reviewer(prompt: str, cfg: Config, session: Optional[str]) -> AgentResult:
@@ -729,13 +756,12 @@ class RunReport:
     strategy: str = ""
     implement_attempted: bool = False
     implement_refused: bool = False
-    understanding_confirmed: bool = False
     repos_touched: list = field(default_factory=list)
     branch_blocked_repos: list = field(default_factory=list)
     agent_models: dict = field(default_factory=dict)
-
-
-UNDERSTANDING_KEY = "Task understanding confirmed by the human"
+    forked_from_session: Optional[str] = None
+    open_questions_file: str = ""
+    decisions_out: str = ""
 
 
 def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) -> None:
@@ -752,155 +778,33 @@ def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) 
         log(f"ERROR {report.error}")
 
 
-def build_understanding_prompt(idea: str, repo: Path, clarifications: str = "") -> str:
-    base = (
-        "The human operator just entered this task for a two-agent coding workflow:\n"
-        f"---\n{idea}\n---\n"
-        f"Workspace the agents can see (may contain multiple repos): {repo}\n"
-        "\n"
-        "Before any work starts, restate YOUR understanding of the task so the human "
-        "can confirm it. Respond with ONLY the following structure, no commentary:\n"
-        "TASK TYPE: feature | bug fix | refactor | other (pick one, one line why)\n"
-        "INTENT: the problem or opportunity this addresses, one or two sentences\n"
-        "DESIRED OUTCOME: what will exist or be different when this is done\n"
-        "OUT OF SCOPE: what this explicitly will NOT touch\n"
-        "REPOS AFFECTED: which repos under the workspace this likely touches\n"
-        "SUCCESS CRITERIA: how we will know it worked\n"
-        "ASSUMPTIONS TO CONFIRM: anything you had to guess\n"
-    )
-    if clarifications:
-        base += (
-            "\nThe human already clarified earlier rounds:\n"
-            f"{clarifications}\n"
-            "Incorporate ALL of these into the restatement - do not lose them.\n"
-        )
-    return base
-
-
-def read_multiline_input(prompt: str = "input> ") -> str:
-    """Read possibly-multi-line input, Claude Code style: Enter submits,
-    Ctrl+J inserts a line break. Uses bash readline (the same binding trick
-    as launch.sh's task prompt) so both input points behave identically.
-    Falls back to line-by-line input finished by an empty line when bash or
-    a TTY is unavailable."""
-    bash = shutil.which("bash")
-    if bash and sys.stdin.isatty():
-        script = ("bind '\"\\C-j\": self-insert' 2>/dev/null; "
-                  "IFS= read -e -r -p \"$CS_PROMPT\" CS_LINE; "
-                  "printf %s \"$CS_LINE\"")
-        env = dict(os.environ, CS_PROMPT=prompt)
-        try:
-            res = subprocess.run([bash, "-c", script], stdin=sys.stdin,
-                                 stdout=subprocess.PIPE, env=env)
-            return res.stdout.decode("utf-8", "replace")
-        except Exception:
-            pass
-    lines = []
-    while True:
-        try:
-            line = input()
-        except EOFError:
-            break
-        if not line.strip() and lines:
-            break
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def understanding_phase(idea: str, cfg: Config, report: RunReport,
-                        settled: dict) -> "tuple[bool, Optional[str], bool]":
-    """Drafter restates the task; the human confirms before loop tokens are spent.
-
-    Returns (ok, statement, confirmed). ok=False means the drafter call failed
-    (report is filled in - caller should exit). The confirmed statement is stored
-    in settled under UNDERSTANDING_KEY so it flows to the reviewer automatically
-    and is skipped on --decisions resume. Non-interactive runs record the
-    (unconfirmed) statement as an audit artifact without blocking.
-    """
-    if UNDERSTANDING_KEY in settled:
-        log("task understanding: already confirmed in decisions - skipping phase")
-        return True, settled[UNDERSTANDING_KEY], True
-    if cfg.dry_run:
-        log("DRY-RUN understanding statement: <dry-run: structured restatement of the task>")
-        return True, None, False
-
-    interactive = not cfg.non_interactive and sys.stdin.isatty()
-    clarifications = ""
-    rounds = 0
-    while True:
-        res = drafter(build_understanding_prompt(idea, cfg.repo, clarifications),
-                      cfg, None, "plan")
-        if not res.ok or not res.text.strip():
-            record_failure(res, "understanding pass failed", cfg, report)
-            return False, None, False
-        statement = res.text.strip()
-        rounds += 1
-
-        if not interactive:
-            log("non-interactive: drafter's understanding recorded (UNCONFIRMED):")
-            for line in statement.splitlines():
-                log(f"  | {line}")
-            (cfg.history_dir / "understanding.md").write_text(statement + "\n",
-                                                              encoding="utf-8")
-            return True, statement, False
-
-        print(f"\n===== DRAFTER'S UNDERSTANDING (round {rounds}) =====",
-              file=sys.stderr, flush=True)
-        print(statement, file=sys.stderr, flush=True)
-        print("=" * 52, file=sys.stderr, flush=True)
-        print("Type y and press Enter to CONFIRM this understanding and start the",
-              file=sys.stderr, flush=True)
-        print("consensus loop. Type anything else to give a clarification instead:",
-              file=sys.stderr, flush=True)
-        try:
-            ans = input("(confirm? y/n): ").strip().lower()
-        except EOFError:
-            ans = ""
-        if ans.startswith("y"):
-            settled[UNDERSTANDING_KEY] = statement
-            report.decisions = dict(settled)
-            report.understanding_confirmed = True
-            (cfg.history_dir / "understanding.md").write_text(statement + "\n",
-                                                              encoding="utf-8")
-            log("task understanding CONFIRMED - it now anchors the seed and review prompts")
-            return True, statement, True
-        if rounds >= 8:
-            log("note: 8+ clarification rounds - consider rewriting the task itself "
-                "(Ctrl+C, then rerun with a clearer prompt)")
-        print("Type your clarification (Enter submits; Ctrl+J starts a new line):",
-              file=sys.stderr, flush=True)
-        raw = read_multiline_input("clarify> ")
-        clarify = [l for l in raw.splitlines() if l.strip()]
-        if clarify:
-            clarifications += "- " + "\n- ".join(clarify) + "\n"
-
-
 def log_usage_estimate(cfg: Config, implement: bool) -> None:
     """Rough pre-run token budget so the human can decide whether to spend a
     5h/weekly coding-plan window on this run at all.
 
     zcode numbers are measured on this setup (live review calls: ~13k input /
-    ~0.3k output each, roughly 80% cache-read). claude numbers are ASSUMED until
-    the first claude-side run - the post-run per-agent usage totals in the run
-    summary are the honest numbers; refine these after run one.
+    ~0.3k output each, roughly 80% cache-read). claude numbers are measured from
+    the first real claude-side run; refine as usage data accumulates.
     """
     n = cfg.max_iterations
     log(f"usage ESTIMATE for up to {n} review cycle(s): "
         f"zcode ~{n * 13_000:,} in / ~{n * 300:,} out (measured basis); "
-        f"claude ~{n * 15_000:,} in / ~{n * 1_500:,} out (assumed - refine after "
-        "the first claude-side run)")
+        f"claude ~{n * 15_000:,} in / ~{n * 1_500:,} out (rough)")
+    if cfg.fork_session_id:
+        log("note: --fork re-sends the forked conversation's FULL context on every "
+            "revise call - claude-side cost scales with that conversation's size")
     if implement:
         log("note: --implement is the budget-dominating pass on 5h/weekly coding "
             "plans (agentic, multi-turn, edits files) and is NOT included in the "
             "estimate above")
 
 
-def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
+def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
     usage_by_agent: dict = {"claude": {}, "zcode": {}}
     report.usage = usage_by_agent
     if not cfg.dry_run:
         cfg.history_dir.mkdir(parents=True, exist_ok=True)
-    drafter_session: Optional[str] = None
+    drafter_session: Optional[str] = None   # the loop's OWN session (fork or chained)
     reviewer_session: Optional[str] = None
 
     def accumulate(usage: dict, agent: str) -> None:
@@ -917,39 +821,21 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
 
     log_usage_estimate(cfg, implement)
 
-    # --- understanding confirmation (step 0; skipped on resume) ---------------
-    resume_run = (bool(cfg.decisions_file) and cfg.plan_path.exists()
-                  and cfg.plan_path.stat().st_size > 0)
-    understanding: Optional[str] = None
-    if resume_run:
-        understanding = settled.get(UNDERSTANDING_KEY)
-        report.understanding_confirmed = understanding is not None
-    else:
-        ok, understanding, confirmed = understanding_phase(idea, cfg, report, settled)
-        if not ok:
-            return EXIT_ERROR
-        report.understanding_confirmed = confirmed
+    # The plan is the caller's input: it already exists (the interactive session
+    # wrote it). There is no seed pass; this engine only reviews and revises.
+    plan_text = cfg.plan_path.read_text(encoding="utf-8").strip()
+    if not plan_text:
+        report.error = f"plan file {cfg.plan_path} is empty"
+        log(f"ERROR {report.error}")
+        return EXIT_ERROR
+    log(f"plan under review: {cfg.plan_path} ({len(plan_text)} chars); "
+        f"agents' workspace: {cfg.repo}")
 
-    # --- seed: drafter produces plan v1 (skipped when resuming with decisions) ----
-    if resume_run:
-        plan_text = cfg.plan_path.read_text(encoding="utf-8").strip()
-        log(f"resuming: reviewing existing {cfg.plan_path.name} ({len(plan_text)} chars); "
-            "seed pass skipped so settled decisions are not re-drafted (delete the "
-            "plan or change --plan-out to force a fresh draft)")
-    else:
-        log(f"seed: asking drafter (claude) for plan v1 in {cfg.repo}")
-        seed = drafter(build_seed_prompt(idea, cfg.repo, understanding, report.understanding_confirmed), cfg, drafter_session if cfg.strategy == "chained" else None, "plan")
-        if not seed.ok or not seed.text.strip():
-            record_failure(seed, "drafter seed failed", cfg, report)
-            return EXIT_ERROR
-        accumulate(seed.usage, "claude")
-        if cfg.strategy == "chained":
-            drafter_session = seed.session_id
-        plan_text = seed.text.strip()
-        if not cfg.dry_run:
-            cfg.plan_path.write_text(plan_text + "\n", encoding="utf-8")
-            snapshot(cfg.plan_path, cfg.history_dir, "plan-v01-seed.md")
-        log(f"plan v1 written ({len(plan_text)} chars) -> {cfg.plan_path}")
+    # Continue snapshot numbering across resumed runs (rate-limit / open-question
+    # exits) so plan-history stays a linear record of the whole consensus effort.
+    existing = sorted(int(m.group(1)) for p in cfg.history_dir.glob("plan-v*.md")
+                      if (m := re.match(r"plan-v(\d+)\.md$", p.name)))
+    vnum = (existing[-1] if existing else 0)
 
     consensus = False
     verdict: Optional[Verdict] = None
@@ -958,7 +844,8 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
     for i in range(1, cfg.max_iterations + 1):
         iterations_used = i
         log(f"iteration {i}/{cfg.max_iterations}: reviewer (zcode) examining {cfg.plan_path.name}")
-        review = reviewer(build_review_prompt(cfg.plan_path.name, cfg.review_rules, settled), cfg,
+        review = reviewer(build_review_prompt(cfg.plan_path.name, cfg.review_rules,
+                                              cfg.brief_text, settled), cfg,
                           reviewer_session if cfg.strategy == "chained" else None)
         if not review.ok:
             record_failure(review, "reviewer call failed", cfg, report)
@@ -987,19 +874,23 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
 
         # --- human resolution phase: product/direction decisions --------------
         if verdict.open_questions:
-            new_answers = resolve_open_questions(verdict.open_questions, settled, cfg, i)
-            if new_answers is None:
-                report.outcome = "blocked-on-human"
-                report.open_questions = [
-                    q for q in verdict.open_questions if q["question"] not in settled]
-                return EXIT_BLOCKED_ON_HUMAN
-            if new_answers:
-                settled.update(new_answers)
-                report.decisions = dict(settled)
+            fresh = [q for q in verdict.open_questions if q["question"] not in settled]
+            if fresh:
+                # Non-interactive by design: the interactive session (the chat the
+                # plugin command runs in) collects answers and re-invokes with
+                # --decisions. Questions land in open-questions.json.
+                oq_path = cfg.history_dir / "open-questions.json"
+                payload = [{**q, "answer": ""} for q in fresh]
                 if not cfg.dry_run:
-                    (cfg.history_dir / f"decisions-iter-{i:02d}.json").write_text(
-                        json.dumps([{"question": q, "answer": a} for q, a in settled.items()],
-                                   indent=2, ensure_ascii=False), encoding="utf-8")
+                    oq_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                                       encoding="utf-8")
+                report.open_questions_file = str(oq_path)
+                report.outcome = "blocked-on-human"
+                report.open_questions = fresh
+                log(f"BLOCKED ON HUMAN: {len(fresh)} product/direction question(s) "
+                    f"written to {oq_path}. The interactive session collects answers, "
+                    f"then re-runs with --decisions {oq_path}")
+                return EXIT_BLOCKED_ON_HUMAN
 
         if verdict.approve:
             consensus = True
@@ -1013,19 +904,33 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
              "objections": verdict.blocking + verdict.minor,
              "settled_human_decisions": [{"question": q, "answer": a}
                                          for q, a in settled.items()]}, indent=2)
-        revised = drafter(build_revise_prompt(plan_text, objections_json, settled), cfg,
-                          drafter_session if cfg.strategy == "chained" else None, "plan")
+        # First revise call forks the interactive conversation when asked (full
+        # context, zero risk to the live session); the fork's returned session
+        # then chains for later iterations under 'chained'. 'fresh' sessions get
+        # plan + objections + brief inline each time.
+        fork_this = bool(cfg.fork_session_id and drafter_session is None
+                         and cfg.strategy == "chained")
+        use_session = drafter_session if cfg.strategy == "chained" else (
+            cfg.fork_session_id if fork_this else None)
+        revised = drafter(build_revise_prompt(plan_text, objections_json,
+                                              cfg.brief_text, settled), cfg,
+                          use_session, "plan", fork=fork_this)
         if not revised.ok or not revised.text.strip():
             record_failure(revised, "drafter revise failed", cfg, report)
             return EXIT_ERROR
         accumulate(revised.usage, "claude")
         if cfg.strategy == "chained":
             drafter_session = revised.session_id
+            if fork_this and revised.session_id:
+                report.forked_from_session = cfg.fork_session_id
+                log(f"revise session forked from interactive conversation "
+                    f"{cfg.fork_session_id[:8]}... -> {revised.session_id[:8]}...")
         plan_text = revised.text.strip()
         if not cfg.dry_run:
             cfg.plan_path.write_text(plan_text + "\n", encoding="utf-8")
-            snapshot(cfg.plan_path, cfg.history_dir, f"plan-v{i + 1:02d}.md")
-        log(f"plan v{i + 1} written ({len(plan_text)} chars)")
+            vnum += 1
+            snapshot(cfg.plan_path, cfg.history_dir, f"plan-v{vnum:02d}.md")
+        log(f"revised plan written ({len(plan_text)} chars) -> {cfg.plan_path}")
 
     # --- outcome -------------------------------------------------------------
     report.iterations_used = iterations_used
@@ -1035,7 +940,6 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
         report.blocking_remaining = verdict.blocking
         report.minor_remaining = verdict.minor
     summary = {
-        "idea": idea,
         "outcome": outcome,
         "strategy": cfg.strategy,
         "iterations_used": iterations_used,
@@ -1057,15 +961,15 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
                 log(f"  minor:    {ob['point']}")
         log(f"Full detail (per-iteration reviews, open questions, decisions): "
             f"{cfg.history_dir}/review-iter-{iterations_used:02d}.json - "
-            "raise --max-iterations, loosen the idea, or resolve the objections above.")
+            "raise --max-iterations, loosen the plan, or resolve the objections above.")
         return EXIT_NO_CONSENSUS
 
     log(f"CONSENSUS reached after {iterations_used} iteration(s). Final plan: {cfg.plan_path}")
 
     if implement:
-        # Targets are chosen by the agents (reviewer verdict / understanding),
-        # overridable by --implement-repo. The human only owns git state.
-        targets = cfg.implement_repos or resolve_implement_targets(cfg, verdict, understanding)
+        # Targets are chosen by the AGENTS (reviewer verdict), overridable by
+        # --implement-repo. The human only owns git state.
+        targets = cfg.implement_repos or resolve_implement_targets(cfg, verdict)
         report.repos_touched = [str(t) for t in targets]
         log(f"implement targets (chosen by the agents): "
             f"{', '.join(t.name for t in targets)}")
@@ -1109,7 +1013,7 @@ def run_loop(idea: str, cfg: Config, implement: bool, report: RunReport) -> int:
 
 
 # --------------------------------------------------------------------------
-# Human resolution phase
+# Human decisions + implement targeting
 # --------------------------------------------------------------------------
 
 def load_decisions_file(path: str) -> dict:
@@ -1134,70 +1038,10 @@ def load_decisions_file(path: str) -> dict:
     return out
 
 
-def _ask_human(q: dict, n: int, total: int) -> str:
-    # Everything to stderr: stdout stays reserved for the exit-time JSON line.
-    print(f"\n--- OPEN QUESTION {n}/{total} (human decision required) ---",
-          file=sys.stderr, flush=True)
-    print(f"  {q['question']}", file=sys.stderr, flush=True)
-    if q.get("why"):
-        print(f"  why it matters: {q['why']}", file=sys.stderr, flush=True)
-    if q.get("options"):
-        print(f"  options: {', '.join(q['options'])}", file=sys.stderr, flush=True)
-    if q.get("recommendation"):
-        print(f"  reviewer recommendation: {q['recommendation']}", file=sys.stderr, flush=True)
-    try:
-        return input("  your decision (free text; Enter to defer): ").strip()
-    except EOFError:
-        return ""
-
-
-def resolve_open_questions(questions: list, settled: dict, cfg: Config,
-                           iteration: int) -> Optional[dict]:
-    """Get human answers for reviewer-raised open questions.
-
-    Resolution order: questions already settled (earlier iteration or a
-    --decisions file) are skipped; then inline prompting on an interactive
-    terminal; anything still unresolved is written to open-questions.json and
-    the caller must exit blocked-on-human so the human can answer and re-run.
-    Returns {question: answer} for newly resolved questions, None if any remain
-    unresolved.
-    """
-    fresh = [q for q in questions if q["question"] not in settled]
-    if not fresh:
-        return {}
-
-    if cfg.dry_run:
-        return {q["question"]: "dry-run: deferred to human" for q in fresh}
-
-    answers: dict = {}
-    if not cfg.non_interactive and sys.stdin.isatty():
-        log(f"human resolution phase: {len(fresh)} open question(s) need your decisions")
-        for n, q in enumerate(fresh, 1):
-            ans = _ask_human(q, n, len(fresh))
-            if ans:
-                answers[q["question"]] = ans
-        if len(answers) == len(fresh):
-            return answers
-        log(f"{len(fresh) - len(answers)} question(s) deferred by you")
-
-    unresolved = [q for q in fresh if q["question"] not in answers]
-    out_path = cfg.plan_path.parent / "open-questions.json"
-    payload = [{**q, "answer": answers.get(q["question"], "")} for q in fresh]
-    if not cfg.dry_run:
-        out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
-                            encoding="utf-8")
-    log(f"UNRESOLVED product/direction decisions need human input: {len(unresolved)} "
-        f"question(s) written to {out_path}. Fill the 'answer' fields and re-run "
-        f"with --decisions {out_path.name}")
-    return None
-
-
-def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"],
-                              understanding: Optional[str]) -> list:
+def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"]) -> list:
     """Which repos the implement pass should edit - decided by the AGENTS, not
-    the human: the reviewer's repos_touched verdict first, then the confirmed
-    understanding's REPOS AFFECTED line, else all repos under the workspace.
-    --implement-repo flags still override for manual control."""
+    the human: the reviewer's repos_touched verdict first, else all repos under
+    the workspace. --implement-repo flags still override for manual control."""
     candidates = []
     if (cfg.repo / ".git").exists():
         candidates = [cfg.repo]           # single-repo workspace
@@ -1213,12 +1057,6 @@ def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"],
         for r in verdict.repos_touched:
             names.add(r)
             names.add(r.split("/")[-1])
-    if not names and understanding:
-        import re as _re
-        m = _re.search(r"REPOS AFFECTED:?\s*(.+)", understanding, _re.IGNORECASE)
-        if m:
-            blob = m.group(1).lower()
-            names = {c.name.lower() for c in candidates if c.name.lower() in blob}
     if not names:
         log("implement targets: agents named no repos - defaulting to all repos "
             f"under the workspace ({', '.join(c.name for c in candidates)})")
@@ -1242,6 +1080,10 @@ def _git_branch(repo: Path) -> Optional[str]:
     except (subprocess.TimeoutExpired, OSError):
         return None
 
+
+# --------------------------------------------------------------------------
+# Preflight
+# --------------------------------------------------------------------------
 
 def preflight(cfg: Config, report: RunReport) -> int:
     """Live environment checks. Costs two tiny claude calls and one tiny zcode call.
@@ -1267,9 +1109,9 @@ def preflight(cfg: Config, report: RunReport) -> int:
 
     # Agent probes run in an isolated temp dir, never in --repo: plan-mode CLIs can
     # read their working directory, and preflight must not touch the target repo's
-    # files or context before the full stack is verified (first-run sequencing
-    # concern raised in design review). No preflight check needs repo context.
-    with tempfile.TemporaryDirectory(prefix="orchestrator-preflight-") as probe:
+    # files or context before the full stack is verified. No preflight check needs
+    # repo context.
+    with tempfile.TemporaryDirectory(prefix="countersign-preflight-") as probe:
         probe_cwd = Path(probe)
         log(f"preflight: claude CLI (launcher, stdin, JSON shape; probes in {probe})")
         ver_ok = False
@@ -1314,7 +1156,7 @@ def preflight(cfg: Config, report: RunReport) -> int:
                 log(f"  small stdin prompt OK (result={text[:30]!r}, session_id=present)")
                 report.agent_models["claude"] = (
                     f"claude (model: {model})" if model else
-                    "claude (model: account default; pin with --model via /config)")
+                    "claude (model: account default; pin with --model in settings)")
                 log(f"  {report.agent_models['claude']}")
             else:
                 failures.append("claude json shape (result/session_id)")
@@ -1401,19 +1243,43 @@ def preflight(cfg: Config, report: RunReport) -> int:
     return EXIT_CONSENSUS
 
 
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Dual-agent consensus loop: Claude Code drafts a plan, ZCode (GLM) reviews it, "
-                    "loop until the reviewer approves or --max-iterations is hit.")
-    p.add_argument("idea", help="seed idea for the plan")
-    p.add_argument("--repo", default=".", help="repository to plan against (default: cwd)")
-    p.add_argument("--plan-out", default="plan.md", help="path for the plan document")
-    p.add_argument("--history-dir", default="plan-history", help="dir for snapshots, reviews, run summary")
+        description="countersign consensus engine: review an existing plan with ZCode (GLM), "
+                    "revise it with headless claude, loop until consensus. "
+                    "Invoked by the /countersign Claude Code plugin command.")
+    p.add_argument("plan_file", help="path to the plan document to review (reviewed in place)")
+    p.add_argument("--link-repo", metavar="DIR", action="append", default=[],
+                   help="repository the agents may see; REPEAT per repo. A synthetic "
+                        "workspace (~/.countersign/ws/<hash>) is built with junction/"
+                        "symlink entries for exactly these repos. Mutually exclusive "
+                        "with --repo.")
+    p.add_argument("--repo", default=".",
+                   help="workspace directory the agents run in (default: cwd). Use "
+                        "--link-repo instead to grant exactly the listed repos.")
+    p.add_argument("--history-dir", default=None,
+                   help="dir for snapshots, reviews, run summary (default: "
+                        "<plan dir>/.countersign/<plan name>-history)")
+    p.add_argument("--context-brief", metavar="FILE",
+                   help="context brief written by the interactive session (intent, "
+                        "constraints, in-chat decisions); embedded in every review "
+                        "and revise prompt")
+    p.add_argument("--fork-session-id", metavar="SID",
+                   help="fork this claude conversation for the revise calls (full "
+                        "context on every revise; costs scale with that conversation)")
+    p.add_argument("--fork-current-session", action="store_true",
+                   help="same as --fork-session-id but auto-detects the current "
+                        "interactive session from ~/.claude/projects transcripts")
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
-                   help=f"max review->revise cycles (default {DEFAULT_MAX_ITERATIONS})")
+                   help=f"max review->revise cycles per invocation (default {DEFAULT_MAX_ITERATIONS})")
     p.add_argument("--strategy", choices=["fresh", "chained"], default="fresh",
                    help="fresh: new session per call (default, avoids anchoring on rejected "
-                        "drafts); chained: reuse sessions via --resume (cheaper, risks drift)")
+                        "drafts); chained: reuse sessions via --resume (cheaper, risks drift). "
+                        "Required for --fork-session-id to take effect.")
     p.add_argument("--implement", action="store_true",
                    help="after consensus, let claude implement the plan (acceptEdits). "
                         "Git push is never automated.")
@@ -1449,27 +1315,60 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="file of human answers to open questions: the open-questions.json "
                         "this script writes on exit 4 with 'answer' fields filled in, "
                         "or a plain {question: answer} JSON mapping")
-    p.add_argument("--non-interactive", action="store_true",
-                   help="never prompt on the terminal; unresolved open questions exit "
-                        "blocked-on-human (4) with an open-questions.json to answer")
     p.add_argument("--preflight", action="store_true",
                    help="verify both CLIs live (launcher, stdin delivery incl. a ~10KB "
                         "payload, JSON output shape) and exit without running the loop; "
-                        "agent probes run in an isolated temp directory, never in --repo")
+                        "agent probes run in an isolated temp directory")
     p.add_argument("--dry-run", action="store_true",
                    help="print what would be called without invoking any agent")
     args = p.parse_args(argv)
 
-    repo = Path(args.repo).resolve()
-    if not repo.is_dir():
-        print(f"error: --repo {repo} is not a directory", file=sys.stderr)
+    plan_path = Path(args.plan_file).resolve()
+    if args.preflight:
+        pass                       # plan not required for preflight
+    elif not plan_path.is_file():
+        print(f"error: plan file {plan_path} not found", file=sys.stderr)
         return EXIT_ERROR
     for r in args.implement_repo or []:
         if not Path(r).resolve().is_dir():
             print(f"error: --implement-repo {r} is not a directory", file=sys.stderr)
             return EXIT_ERROR
 
+    fork_session_id = args.fork_session_id
+    if args.fork_current_session:
+        if fork_session_id:
+            print("error: --fork-session-id and --fork-current-session are mutually exclusive",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        fork_session_id = discover_current_claude_session(Path.cwd())
+        if not fork_session_id and not args.dry_run:
+            log("note: --fork-current-session found no current session transcript; "
+                "continuing without fork (pass --fork-session-id explicitly instead)")
+
     try:
+        if args.link_repo and args.repo != ".":
+            raise OrchestratorError("--link-repo and --repo are mutually exclusive")
+        if args.link_repo:
+            repo = build_workspace([Path(r) for r in args.link_repo])
+            log(f"synthetic workspace (links to: "
+                f"{', '.join(Path(r).name for r in args.link_repo)}): {repo}")
+        else:
+            repo = Path(args.repo).resolve()
+            if not repo.is_dir():
+                raise OrchestratorError(f"--repo {repo} is not a directory")
+
+        history_dir = (Path(args.history_dir).resolve() if args.history_dir else
+                       plan_path.parent / ".countersign" / f"{plan_path.stem}-history")
+
+        brief_text = ""
+        if args.context_brief:
+            brief_path = Path(args.context_brief).resolve()
+            if not brief_path.is_file():
+                raise OrchestratorError(f"--context-brief {brief_path} not found")
+            brief_text = brief_path.read_text(encoding="utf-8").strip()
+            if not brief_text:
+                raise OrchestratorError(f"--context-brief {brief_path} is empty")
+
         try:
             claude_cmd = resolve_claude_cmd(args.claude_cli, args.dry_run)
         except OrchestratorError as e:
@@ -1482,15 +1381,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             claude_cmd=claude_cmd,
             api_key=zcode_api_key(),
             repo=repo,
-            plan_path=(repo / args.plan_out).resolve(),
-            history_dir=(repo / args.history_dir).resolve(),
+            plan_path=plan_path,
+            history_dir=history_dir,
             max_iterations=max(1, args.max_iterations),
             timeout=args.timeout,
             strategy=args.strategy,
             dry_run=args.dry_run,
             review_rules=load_review_rules(args.review_rules, args.replace_default_rules),
+            brief_text=brief_text,
             decisions_file=args.decisions,
-            non_interactive=args.non_interactive,
+            fork_session_id=fork_session_id,
             max_retries=max(0, args.max_retries),
             retry_base_delay=max(1, args.retry_base_delay),
             implement_repos=([Path(r).resolve() for r in args.implement_repo]
@@ -1507,11 +1407,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         HEARTBEAT_SECS = cfg.heartbeat_secs
         report = RunReport(
             plan=str(cfg.plan_path), history_dir=str(cfg.history_dir),
-            strategy=cfg.strategy)
+            strategy=cfg.strategy, forked_from_session=fork_session_id)
         try:
             if args.preflight:
                 return preflight(cfg, report)
-            return run_loop(args.idea, cfg, args.implement, report)
+            return run_loop(cfg, args.implement, report)
         except KeyboardInterrupt:
             report.outcome = "interrupted"
             raise

@@ -1,0 +1,9 @@
+{
+  "plugins": [
+    {
+      "name": "countersign",
+      "source": "./",
+      "description": "Dual-agent consensus on planning docs: ZCode (GLM) reviews, headless Claude revises, loops until consensus."
+    }
+  ]
+}
