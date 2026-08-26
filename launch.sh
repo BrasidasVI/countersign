@@ -263,20 +263,15 @@ while :; do
   show_config
   say "YOUR TASK PROMPT - type what the agents should work on"
   echo "   Type /config (Enter) to change settings first."
-  echo "   Finish with a blank line (Enter on an empty line submits). Ctrl+C cancels."
+  echo "   Press Enter to submit the task (single line). Ctrl+C cancels."
   TASK=""
-  IFS= read -r line || break
+  IFS= read -r line || exit 1
   if [[ "$(printf '%s' "$line" | tr -d '[:space:]')" == "/config" ]]; then
     run_config_prompts
     build_args
     continue
   fi
-  TASK+="$line"$'\n'
-  while :; do
-    IFS= read -r line || break
-    if [[ -z "$line" && -n "$TASK" ]]; then break; fi
-    TASK+="$line"$'\n'
-  done
+  TASK="$line"$'\n'
   if [[ -z "${TASK//[$' \t\n']/}" ]]; then
     echo "Empty task prompt - aborting." >&2
     exit 1
