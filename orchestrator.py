@@ -818,8 +818,12 @@ def understanding_phase(idea: str, cfg: Config, report: RunReport,
               file=sys.stderr, flush=True)
         print(statement, file=sys.stderr, flush=True)
         print("=" * 52, file=sys.stderr, flush=True)
+        print("Type y and press Enter to CONFIRM this understanding and start the",
+              file=sys.stderr, flush=True)
+        print("consensus loop. Type anything else to give a clarification instead:",
+              file=sys.stderr, flush=True)
         try:
-            ans = input("Does this match your intent? (y/n): ").strip().lower()
+            ans = input("(confirm? y/n): ").strip().lower()
         except EOFError:
             ans = ""
         if ans.startswith("y"):
@@ -833,7 +837,9 @@ def understanding_phase(idea: str, cfg: Config, report: RunReport,
         if rounds >= 8:
             log("note: 8+ clarification rounds - consider rewriting the task itself "
                 "(Ctrl+C, then rerun with a clearer prompt)")
-        print("Enter your clarification, one line at a time; a blank line finishes it:",
+        print("Type your clarification, one line per point. Press Enter on an EMPTY",
+              file=sys.stderr, flush=True)
+        print("line to finish and get an updated understanding:",
               file=sys.stderr, flush=True)
         clarify = []
         while True:
