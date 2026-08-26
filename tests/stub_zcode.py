@@ -7,6 +7,8 @@ Mode comes from CS_STUB_MODE env (inherited through the engine's subprocess):
 - "openq"  : call 1 returns approve WITH an open question (engine must exit
              blocked-on-human), later calls approve.  [decisions resume]
 - "approve": always approve.                          [implement paths]
+- "badjson": call 1 returns unparseable prose (engine must re-ask, NOT burn
+             an iteration), later calls approve.  [parse retry]
 
 The per-plan call count persists in CS_STUB_STATE_DIR keyed by the --attach
 plan path, so re-runs (e.g. after --decisions) see call 2.
@@ -33,6 +35,17 @@ key = hashlib.md5((attach or "none").encode()).hexdigest()[:12]
 counter = state_dir / f"{key}.count"
 n = (int(counter.read_text()) if counter.exists() else 0) + 1
 counter.write_text(str(n))
+
+if mode == "badjson" and n == 1:
+    # Unparseable reviewer output: prose, no JSON anywhere.
+    print(json.dumps({
+        "response": "Overall this plan looks reasonable to me. I read the "
+                    "attached document and the code and have some thoughts, "
+                    "but I will keep them informal. No JSON here.",
+        "sessionId": f"stub-zcode-{n}",
+        "usage": {"input_tokens": 1000, "output_tokens": 50},
+    }))
+    sys.exit(0)
 
 if mode == "approve" or (n >= 2):
     verdict = {

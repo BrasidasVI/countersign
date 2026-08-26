@@ -512,6 +512,12 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "one) may be surfaced in fyi_notes so the human stays aware; fyi_notes "
         "never block consensus and never require a decision.\n"
         "- Do not review style, only substance.\n"
+        "- You are not just a gatekeeper: actively look for ways to IMPROVE the "
+        "design - simpler alternatives, missed edge cases, a sharper test "
+        "strategy, clearer contracts, better resilience or performance. Raise "
+        "each as a 'minor' objection with the concrete improvement (blocking "
+        "only if the plan's approach is materially deficient). Approving with "
+        "zero suggestions should mean you genuinely could not find any.\n"
         "\n"
         "Required invariants - a plan that violates ANY of these MUST get verdict "
         '"revise" with the violation reported as a BLOCKING objection:\n'
@@ -697,6 +703,7 @@ class Config:
     fork_session_id: Optional[str] = None
     max_retries: int = 2
     retry_base_delay: int = 30
+    review_parse_retries: int = 1
     implement_repos: list = field(default_factory=list)
     heartbeat_secs: int = DEFAULT_HEARTBEAT_SECS
 
@@ -855,13 +862,37 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         if cfg.strategy == "chained":
             reviewer_session = review.session_id
         verdict = parse_verdict(review.text)
+        # An unparseable review is a REVIEWER-side failure, not a plan defect:
+        # re-ask with a stricter JSON-only instruction instead of burning an
+        # iteration on a meaningless "not valid JSON" objection.
+        for attempt in range(1, cfg.review_parse_retries + 1):
+            if verdict.raw_ok:
+                break
+            log(f"iteration {i}: reviewer reply was not valid JSON - re-asking "
+                f"with stricter instruction (parse retry {attempt}/"
+                f"{cfg.review_parse_retries})")
+            retry_prompt = build_review_prompt(
+                cfg.plan_path.name, cfg.review_rules, cfg.brief_text, settled) + (
+                "\n\nIMPORTANT: your PREVIOUS reply was not valid JSON. Respond "
+                "with ONLY the raw JSON object - no markdown fences, no prose "
+                "before or after, every string properly escaped.")
+            review = reviewer(retry_prompt, cfg,
+                              reviewer_session if cfg.strategy == "chained" else None)
+            if not review.ok:
+                record_failure(review, "reviewer retry failed", cfg, report)
+                return EXIT_ERROR
+            accumulate(review.usage, "zcode")
+            if cfg.strategy == "chained":
+                reviewer_session = review.session_id
+            verdict = parse_verdict(review.text)
         if not cfg.dry_run:
             (cfg.history_dir / f"review-iter-{i:02d}.json").write_text(
                 json.dumps({"verdict": verdict.approve, "raw_ok": verdict.raw_ok,
                             "blocking": verdict.blocking, "minor": verdict.minor,
                             "open_questions": verdict.open_questions,
                             "fyi_notes": verdict.fyi_notes,
-                            "summary": verdict.summary, "sessionId": review.session_id},
+                            "summary": verdict.summary, "sessionId": review.session_id,
+                            "raw": verdict.raw[:4000]},
                            indent=2, ensure_ascii=False), encoding="utf-8")
         log(f"iteration {i}: verdict={'APPROVE' if verdict.approve else 'REVISE'} "
             f"({len(verdict.blocking)} blocking, {len(verdict.minor)} minor, "
@@ -1298,6 +1329,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "with outcome 'rate-limited'")
     p.add_argument("--retry-base-delay", type=int, default=30,
                    help="base backoff delay in seconds; doubles each retry (default 30)")
+    p.add_argument("--review-parse-retries", type=int, default=1,
+                   help="re-asks per iteration when the reviewer reply is not valid "
+                        "JSON, instead of treating it as a blocking plan objection "
+                        "(default 1; 0 restores the old behavior)")
     p.add_argument("--heartbeat", type=int, default=DEFAULT_HEARTBEAT_SECS,
                    help="seconds between in-flight progress lines during long agent "
                         f"calls (default {DEFAULT_HEARTBEAT_SECS}; 0 disables)")
@@ -1394,6 +1429,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             fork_session_id=fork_session_id,
             max_retries=max(0, args.max_retries),
             retry_base_delay=max(1, args.retry_base_delay),
+            review_parse_retries=max(0, args.review_parse_retries),
             implement_repos=([Path(r).resolve() for r in args.implement_repo]
                              if args.implement_repo else []),
             heartbeat_secs=max(0, args.heartbeat),

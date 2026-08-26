@@ -138,6 +138,21 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("file landed in REAL repo", (repoA / "stub-implement.txt").is_file())
     check("agents chose repoa", "repoa" in " ".join(rep.get("repos_touched", [])))
 
+    print("scenario E: unparseable review re-asked, not treated as plan defect")
+    planE = make_plan(repoA, "plan-e.md", "# Plan E\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planE, [repoA, repoB], stub_mode="badjson")
+    check("exit code 0", rc == 0, f"rc={rc}")
+    check("consensus on iteration 1 (retry did not burn it)",
+          rep and rep.get("outcome") == "consensus" and rep.get("iterations_used") == 1,
+          str(rep)[:120])
+    check("reviewer called twice (retry happened)",
+          rep.get("usage", {}).get("zcode", {}).get("input_tokens") == 2000,
+          json.dumps(rep.get("usage", {})))
+    check("plan untouched (no nonsense objection sent to drafter)",
+          "Stub revision" not in planE.read_text(encoding="utf-8"))
+    rj = json.loads((Path(rep["history_dir"]) / "review-iter-01.json").read_text(encoding="utf-8"))
+    check("raw verdict persisted", "raw" in rj and rj["raw"].startswith("{"))
+
     # junction workspace must expose ONLY the linked repos
     ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
