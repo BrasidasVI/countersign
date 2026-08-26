@@ -777,6 +777,36 @@ def build_understanding_prompt(idea: str, repo: Path, clarifications: str = "") 
     return base
 
 
+def read_multiline_input(prompt: str = "input> ") -> str:
+    """Read possibly-multi-line input, Claude Code style: Enter submits,
+    Ctrl+J inserts a line break. Uses bash readline (the same binding trick
+    as launch.sh's task prompt) so both input points behave identically.
+    Falls back to line-by-line input finished by an empty line when bash or
+    a TTY is unavailable."""
+    bash = shutil.which("bash")
+    if bash and sys.stdin.isatty():
+        script = ("bind '\"\\C-j\": self-insert' 2>/dev/null; "
+                  "IFS= read -e -r -p \"$CS_PROMPT\" CS_LINE; "
+                  "printf %s \"$CS_LINE\"")
+        env = dict(os.environ, CS_PROMPT=prompt)
+        try:
+            res = subprocess.run([bash, "-c", script], stdin=sys.stdin,
+                                 stdout=subprocess.PIPE, env=env)
+            return res.stdout.decode("utf-8", "replace")
+        except Exception:
+            pass
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip() and lines:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def understanding_phase(idea: str, cfg: Config, report: RunReport,
                         settled: dict) -> "tuple[bool, Optional[str], bool]":
     """Drafter restates the task; the human confirms before loop tokens are spent.
@@ -837,19 +867,10 @@ def understanding_phase(idea: str, cfg: Config, report: RunReport,
         if rounds >= 8:
             log("note: 8+ clarification rounds - consider rewriting the task itself "
                 "(Ctrl+C, then rerun with a clearer prompt)")
-        print("Type your clarification, one line per point. Press Enter on an EMPTY",
+        print("Type your clarification (Enter submits; Ctrl+J starts a new line):",
               file=sys.stderr, flush=True)
-        print("line to finish and get an updated understanding:",
-              file=sys.stderr, flush=True)
-        clarify = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if not line.strip() and clarify:
-                break
-            clarify.append(line)
+        raw = read_multiline_input("clarify> ")
+        clarify = [l for l in raw.splitlines() if l.strip()]
         if clarify:
             clarifications += "- " + "\n- ".join(clarify) + "\n"
 
