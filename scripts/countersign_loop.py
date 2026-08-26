@@ -790,6 +790,9 @@ class RunReport:
     forked_from_session: Optional[str] = None
     open_questions_file: str = ""
     decisions_out: str = ""
+    plan_sha256: str = ""
+    plan_branch: Optional[str] = None
+    plan_commit: Optional[str] = None
 
 
 def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) -> None:
@@ -804,6 +807,20 @@ def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) 
         report.outcome = "error"
         report.error = f"{what}: {res.stderr or 'empty response'}"
         log(f"ERROR {report.error}")
+
+
+def _git_context(path: Path) -> "tuple[Optional[str], Optional[str]]":
+    """(branch, commit) of the repo containing path, or (None, None)."""
+    try:
+        b = subprocess.run(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=15)
+        c = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=15)
+        branch = b.stdout.strip() if b.returncode == 0 else None
+        commit = c.stdout.strip()[:12] if c.returncode == 0 else None
+        return branch, commit
+    except (subprocess.TimeoutExpired, OSError):
+        return None, None
 
 
 def acquire_plan_lock(history_dir: Path) -> Optional[Path]:
@@ -1356,6 +1373,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--fork-current-session", action="store_true",
                    help="same as --fork-session-id but auto-detects the current "
                         "interactive session from ~/.claude/projects transcripts")
+    p.add_argument("--expect-sha256", metavar="HASH",
+                   help="sha256 of the plan file as the invoking session read it. "
+                        "The engine refuses to start if the file on disk hashes "
+                        "differently - guards against reviewing a stale/wrong-branch "
+                        "version (e.g. a worktree that branched from the wrong base)")
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
                    help=f"max review->revise cycles per invocation (default {DEFAULT_MAX_ITERATIONS})")
     p.add_argument("--strategy", choices=["fresh", "chained"], default="fresh",
@@ -1496,6 +1518,30 @@ def main(argv: Optional[list[str]] = None) -> int:
             plan=str(cfg.plan_path), history_dir=str(cfg.history_dir),
             strategy=cfg.strategy, forked_from_session=fork_session_id)
         try:
+            # Content fingerprint + git context: prove the engine is reviewing
+            # the exact document the invoking session read. (Inside the try so
+            # the exit-time report line still prints on a mismatch refusal.)
+            if plan_path.is_file():
+                report.plan_sha256 = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+                report.plan_branch, report.plan_commit = _git_context(plan_path.parent)
+            if not args.preflight:
+                if args.expect_sha256 and args.expect_sha256.lower() != report.plan_sha256:
+                    report.outcome = "plan-mismatch"
+                    report.error = (
+                        "the plan on disk does not match the version the session read "
+                        f"(expected sha256 {args.expect_sha256[:12]}..., found "
+                        f"{report.plan_sha256[:12]}...). You are probably on a different "
+                        "branch/worktree than intended (e.g. a worktree branched from the "
+                        "wrong base). Re-read the correct plan, re-hash it, and re-invoke.")
+                    log(f"ERROR {report.error}")
+                    log(f"plan repo context: branch={report.plan_branch} "
+                        f"commit={report.plan_commit}")
+                    return EXIT_ERROR
+                log(f"plan sha256={report.plan_sha256[:12]}... "
+                    "(verified against --expect-sha256)" if args.expect_sha256 else
+                    f"plan sha256={report.plan_sha256[:12]}... (no --expect-sha256 given - "
+                    "pass it to guard against stale/wrong-branch reviews)")
+                log(f"plan repo: branch={report.plan_branch} commit={report.plan_commit}")
             if args.preflight:
                 return preflight(cfg, report)
             plan_lock = acquire_plan_lock(cfg.history_dir) if not cfg.dry_run else "dry-run"

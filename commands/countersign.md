@@ -24,6 +24,16 @@ user which planning document to review before doing anything else.
   and confirm with the user; never guess silently.
 - Read the plan file. If it is clearly a stub or empty, ask the user whether
   you should finish drafting it in-chat first - the engine never drafts.
+- Immediately after reading it, capture its content fingerprint
+  (`sha256sum "<plan path>"`) and remember it — you will pass it to the
+  engine as `--expect-sha256` so it refuses to run if the file on disk turns
+  out to be a different version than the one you read (wrong-branch
+  worktree, base-commit mixup, mid-session edit).
+- Before launching, tell the user which branch and commit of the plan's
+  repo you are about to review (the engine logs it too). If a worktree is
+  active, verify it is based on the user's actual branch — a worktree
+  silently based on `origin/main` while the user works on `dev` reviews a
+  stale plan.
 
 ## Step 2 - device setup (once per device)
 
@@ -62,6 +72,7 @@ Build and run with Bash (adjust flags from the parsed arguments):
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
+  --expect-sha256 "<hash you captured when reading the plan>" \
   $(printf -- '--link-repo %q ' "${REPOS[@]}") \
   --context-brief "<plan-dir>/.countersign/<plan-stem>-context-brief.md" \
   [--decisions "<decisions file>" (only when resuming after answers)] \
@@ -108,6 +119,10 @@ Parse the last stdout line as JSON and branch on `outcome`:
 - **locked** - Another countersign run is already working on this same plan
   (check for a background task in this or another session). Tell the user;
   do not delete the lock unless they confirm the other run is dead.
+- **plan-mismatch** - The plan on disk is NOT the version you read (wrong
+  branch/worktree or it changed under you). Do NOT proceed. Re-locate the
+  correct file, read it fresh, capture the new hash, tell the user what
+  happened, and re-invoke with the new `--expect-sha256`.
 - **no-consensus** - Show the remaining blocking objections from the report
   verbatim. Offer the user the real options: raise `--iterations`, revise
   the plan together in-chat first, or accept the disagreement and stop.

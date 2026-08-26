@@ -172,6 +172,22 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("runs again once lock cleared", rc == 0 and rep.get("outcome") == "consensus")
     check("lock released after run", not (histF / "run.lock").exists())
 
+    print("scenario G: stale/wrong-branch plan refused via --expect-sha256")
+    planG = make_plan(repoA, "plan-g.md", "# Plan G\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planG, [repoA, repoB], extra=["--expect-sha256", "0" * 64],
+                              stub_mode="approve")
+    check("exit code 2", rc == 2, f"rc={rc}")
+    check("outcome plan-mismatch", rep and rep.get("outcome") == "plan-mismatch",
+          str(rep)[:120])
+    check("no review performed", rep.get("iterations_used") == 0)
+    import hashlib as _h
+    good = _h.sha256(planG.read_bytes()).hexdigest()
+    rc, rep, err = run_engine(planG, [repoA, repoB], extra=["--expect-sha256", good],
+                              stub_mode="approve")
+    check("correct hash runs", rc == 0 and rep.get("outcome") == "consensus")
+    check("hash + git context in report",
+          rep.get("plan_sha256") == good and rep.get("plan_branch") in ("main", "dev", "feature/stub"))
+
     # junction workspace must expose ONLY the linked repos
     ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
