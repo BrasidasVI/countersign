@@ -95,6 +95,12 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("fyi surfaced (cumulative)",
           rep.get("fyi_notes") == ["stub fyi note from iteration 1",
                                    "stub fyi: everything looks fine"])
+    check("strengths cumulative in report",
+          rep.get("strengths") == ["stub strength: test strategy covers the crash",
+                                   "stub strength: rollback path is concrete"],
+          str(rep.get("strengths")))
+    check("strengths NOT sent to drafter (revise prompt has objections only)",
+          "strength" not in planA.read_text(encoding="utf-8").lower())
     check("usage accumulated",
           rep.get("usage", {}).get("zcode", {}).get("input_tokens") == 2000,
           json.dumps(rep.get("usage", {})))

@@ -84,12 +84,15 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
 
 Parse the last stdout line as JSON and branch on `outcome`:
 
-- **consensus** - Read the final plan. Summarize for the user: what changed
-  between the first reviewed draft and the final plan (the
-  `<history_dir>/plan-v*.md` snapshots are the record), plus any `fyi_notes`
-  from the report. If `implement_attempted` is true, list the edited repos
-  and remind the user changes are uncommitted (`git diff` to review).
-  Nothing is ever committed or pushed by this command.
+- **consensus** - Read the final plan. Tell the user three things: (1) what
+  changed between the first reviewed draft and the final plan (the
+  `<history_dir>/plan-v*.md` snapshots are the record); (2) what the reviewer
+  explicitly VALIDATED as strong (`strengths` in the report - the parts of
+  the design that held up, so the user knows what not to second-guess);
+  (3) any `fyi_notes` from the report. If `implement_attempted` is true,
+  list the edited repos and remind the user changes are uncommitted
+  (`git diff` to review). Nothing is ever committed or pushed by this
+  command.
 - **blocked-on-human** - Read `open_questions_file`. Ask the user each
   question IN THIS CHAT, showing options and the reviewer's recommendation.
   After the user answers, fill the `answer` fields into that JSON, save it

@@ -493,6 +493,7 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "no prose before or after it:\n"
         '{"verdict": "approve" or "revise", '
         '"objections": [{"severity": "blocking" or "minor", "point": "one sentence"}], '
+        '"strengths": ["what the plan does right and why it matters - concrete validation, not flattery"], '
         '"open_questions": [{"question": "a decision only the human product owner can make", '
         '"why": "what it affects", "options": ["realistic option", "..."], '
         '"recommendation": "your recommended option and one-line reason"}], '
@@ -518,6 +519,10 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "one) may be surfaced in fyi_notes so the human stays aware; fyi_notes "
         "never block consensus and never require a decision.\n"
         "- Do not review style, only substance.\n"
+        "- strengths is positive validation for the HUMAN (what held up, so they "
+        "stop second-guessing it) - it never affects the verdict and is never sent "
+        "to the drafting agent. When you approve, list at least two concrete "
+        "strengths unless there is genuinely nothing worth validating.\n"
         "- You are not just a gatekeeper: actively look for ways to IMPROVE the "
         "design - simpler alternatives, missed edge cases, a sharper test "
         "strategy, clearer contracts, better resilience or performance. Raise "
@@ -629,6 +634,7 @@ class Verdict:
     minor: list
     open_questions: list
     fyi_notes: list
+    strengths: list
     repos_touched: list
     summary: str
     raw: str
@@ -641,7 +647,7 @@ def parse_verdict(text: str) -> Verdict:
         return Verdict(False, False, [{"severity": "blocking",
                                        "point": "Reviewer output was not valid JSON; "
                                                 "treated as a blocking objection for safety."}],
-                       [], [], [], [], "unparseable reviewer output", text)
+                       [], [], [], [], [], "unparseable reviewer output", text)
     verdict = str(data.get("verdict", "revise")).lower()
     blocking, minor = [], []
     for ob in data.get("objections", []) or []:
@@ -679,11 +685,19 @@ def parse_verdict(text: str) -> Verdict:
             note = str(n).strip()
         if note:
             fyi_notes.append(note)
+    strengths = []
+    for s in data.get("strengths", []) or []:
+        if isinstance(s, dict):
+            s = str(s.get("note") or s.get("text") or s.get("point") or "").strip()
+        else:
+            s = str(s).strip()
+        if s:
+            strengths.append(s)
     # approve here covers objections only; the loop separately requires open_questions
-    # to be empty (via human resolution) before consensus is declared. fyi_notes
-    # deliberately never affect approval - they are awareness-only.
+    # to be empty (via human resolution) before consensus is declared. fyi_notes and
+    # strengths deliberately never affect approval - awareness/validation only.
     approve = verdict == "approve" and not blocking and not open_questions
-    return Verdict(approve, True, blocking, minor, open_questions, fyi_notes,
+    return Verdict(approve, True, blocking, minor, open_questions, fyi_notes, strengths,
                    repos_touched, str(data.get("summary", "")), text)
 
 
@@ -761,6 +775,7 @@ class RunReport:
     minor_remaining: list = field(default_factory=list)
     open_questions: list = field(default_factory=list)   # unresolved at exit
     fyi_notes: list = field(default_factory=list)        # awareness-only, cumulative
+    strengths: list = field(default_factory=list)        # reviewer validation, cumulative, human-only
     decisions: dict = field(default_factory=dict)        # settled human decisions
     usage: dict = field(default_factory=dict)            # per-agent token totals
     preflight_failures: list = field(default_factory=list)
@@ -920,6 +935,7 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
                             "blocking": verdict.blocking, "minor": verdict.minor,
                             "open_questions": verdict.open_questions,
                             "fyi_notes": verdict.fyi_notes,
+                            "strengths": verdict.strengths,
                             "summary": verdict.summary, "sessionId": review.session_id,
                             "raw": verdict.raw[:4000]},
                            indent=2, ensure_ascii=False), encoding="utf-8")
@@ -927,6 +943,11 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
             f"({len(verdict.blocking)} blocking, {len(verdict.minor)} minor, "
             f"{len(verdict.open_questions)} open questions) "
             f"- {verdict.summary[:100]}")
+        for s in verdict.strengths:
+            if s in report.strengths:
+                continue        # already validated in an earlier iteration
+            report.strengths.append(s)
+            log(f"reviewer VALIDATED: {s[:120]}")
         for note in verdict.fyi_notes:
             if note in report.fyi_notes:
                 continue   # already surfaced in an earlier iteration

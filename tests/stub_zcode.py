@@ -54,6 +54,7 @@ if mode == "approve" or (n >= 2):
         "open_questions": [],
         "fyi_notes": ["stub fyi: everything looks fine"],
         "repos_touched": ["repoa"],
+        "strengths": ["stub strength: rollback path is concrete"],
         "summary": "stub approval",
     }
 elif mode == "openq":
@@ -68,6 +69,7 @@ elif mode == "openq":
         }],
         "fyi_notes": [],
         "repos_touched": ["repoa"],
+        "strengths": ["stub strength: rollback path is concrete"],
         "summary": "stub needs a human decision",
     }
 else:
@@ -80,6 +82,7 @@ else:
         "open_questions": [],
         "fyi_notes": ["stub fyi note from iteration 1"],
         "repos_touched": ["repoa"],
+        "strengths": ["stub strength: test strategy covers the crash"],
         "summary": "stub wants a revision",
     }
 
