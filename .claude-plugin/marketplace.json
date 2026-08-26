@@ -1,4 +1,9 @@
 {
+  "name": "countersign",
+  "owner": {
+    "name": "BrasidasVI",
+    "url": "https://github.com/BrasidasVI"
+  },
   "plugins": [
     {
       "name": "countersign",
