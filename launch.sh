@@ -263,9 +263,18 @@ while :; do
   show_config
   say "YOUR TASK PROMPT - type what the agents should work on"
   echo "   Type /config (Enter) to change settings first."
-  echo "   Press Enter to submit the task (single line). Ctrl+C cancels."
+  echo "   Enter submits. Ctrl+J starts a new line without submitting. Ctrl+C cancels."
   TASK=""
-  IFS= read -r line || exit 1
+  # Claude Code-style input: Enter (C-m) submits, Ctrl+J (C-j) inserts a line
+  # break. Readline binds C-j to accept-line by default; rebind it for the
+  # duration of this read, then restore.
+  if [[ -t 0 ]]; then
+    bind '"\C-j": self-insert' 2>/dev/null
+    IFS= read -e -r -p "Task> " line || exit 1
+    bind '"\C-j": accept-line' 2>/dev/null
+  else
+    IFS= read -r line || exit 1
+  fi
   if [[ "$(printf '%s' "$line" | tr -d '[:space:]')" == "/config" ]]; then
     run_config_prompts
     build_args
