@@ -7,6 +7,9 @@ Scenarios (sequential, each with its own plan file and fake repos):
   C. branch block      : approve + --implement, repo on main => exit 5, no edits
   D. implement         : same but repo on feature branch => exit 0, file lands
                          in the REAL repo through the junction workspace
+  I. approve-with-minors: approve + minor suggestion => NOT consensus yet, one
+                         more revise round, then consensus; the suggestion
+                         reaches the drafter and the review artifact
 """
 import json
 import os
@@ -88,6 +91,9 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("exit code 0", rc == 0, f"rc={rc}")
     check("outcome consensus", rep and rep.get("outcome") == "consensus", str(rep)[:120])
     check("iterations_used == 2", rep and rep.get("iterations_used") == 2)
+    check("no objections remain on consensus",
+          rep.get("blocking_remaining") == [] and rep.get("minor_remaining") == [],
+          str(rep)[:160])
     check("plan rewritten in place", "Stub revision" in planA.read_text(encoding="utf-8"))
     hist = Path(rep["history_dir"])
     check("snapshot plan-v01.md", (hist / "plan-v01.md").is_file())
@@ -158,6 +164,8 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
           "Stub revision" not in planE.read_text(encoding="utf-8"))
     rj = json.loads((Path(rep["history_dir"]) / "review-iter-01.json").read_text(encoding="utf-8"))
     check("raw verdict persisted", "raw" in rj and rj["raw"].startswith("{"))
+    check("raw persisted untruncated (>4000 chars)",
+          len(rj["raw"]) > 4000, str(len(rj["raw"])))
 
     print("scenario F: second concurrent run on the same plan is refused")
     planF = make_plan(repoA, "plan-f.md", "# Plan F\n\nGoal: stub goal.\n")
@@ -214,6 +222,21 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("worktree mismatch warned",
           any("different checkouts" in w for w in rep.get("warnings", [])),
           str(rep.get("warnings"))[:160])
+
+    print("scenario I: approve-with-minors gets one more revise round")
+    planI = make_plan(repoA, "plan-i.md", "# Plan I\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planI, [repoA, repoB], stub_mode="approveminors")
+    check("exit code 0", rc == 0, f"rc={rc}")
+    check("approve-with-minors did not end the loop (consensus on iteration 2)",
+          rep and rep.get("outcome") == "consensus" and rep.get("iterations_used") == 2,
+          str(rep)[:160])
+    check("no minors remain on consensus", rep.get("minor_remaining") == [])
+    check("reviewer suggestion reached the drafter",
+          "spell out the retry policy" in planI.read_text(encoding="utf-8"))
+    rj1 = json.loads((Path(rep["history_dir"]) / "review-iter-01.json").read_text(encoding="utf-8"))
+    check("suggestion persisted in review artifact",
+          rj1["minor"][0].get("suggestion") == "stub suggestion: spell out the retry policy",
+          json.dumps(rj1["minor"]))
 
     # junction workspace must expose ONLY the linked repos
     ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign

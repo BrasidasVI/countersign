@@ -22,7 +22,11 @@ if "Implement the plan" in prompt:
 elif "REVIEWER OBJECTIONS" in prompt:
     m = re.search(r"=== CURRENT PLAN ===\n(.*?)\n=== END PLAN ===", prompt, re.DOTALL)
     base = m.group(1).strip() if m else "STUB PLAN"
-    result = base + "\n\n## Stub revision\n\nAll reviewer objections addressed.\n"
+    o = re.search(r"=== REVIEWER OBJECTIONS \(JSON\) ===\n(.*?)\n=== END OBJECTIONS ===",
+                  prompt, re.DOTALL)
+    objections = o.group(1).strip() if o else "(none received)"
+    result = (base + "\n\n## Stub revision\n\nAll reviewer objections addressed.\n\n"
+              "### Objections received\n\n" + objections + "\n")
 else:
     result = "OK"
 print(json.dumps({

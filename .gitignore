@@ -4,3 +4,6 @@ __pycache__/
 
 # Occasional local artifacts
 *.log
+
+# ZCode CLI session artifacts (plan-mode snapshots)
+.zcode/

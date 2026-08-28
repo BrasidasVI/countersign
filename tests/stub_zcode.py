@@ -9,6 +9,9 @@ Mode comes from CS_STUB_MODE env (inherited through the engine's subprocess):
 - "approve": always approve.                          [implement paths]
 - "badjson": call 1 returns unparseable prose (engine must re-ask, NOT burn
              an iteration), later calls approve.  [parse retry]
+- "approveminors": call 1 returns approve WITH a minor objection carrying a
+             suggestion (engine must NOT end the loop - one more revise
+             round), later calls approve.          [minors gate consensus]
 
 The per-plan call count persists in CS_STUB_STATE_DIR keyed by the --attach
 plan path, so re-runs (e.g. after --decisions) see call 2.
@@ -47,7 +50,21 @@ if mode == "badjson" and n == 1:
     }))
     sys.exit(0)
 
-if mode == "approve" or (n >= 2):
+if mode == "approveminors" and n == 1:
+    verdict = {
+        "verdict": "approve",
+        "objections": [{"severity": "minor",
+                        "point": "stub approve-with-minors: error handling "
+                                 "is underspecified",
+                        "suggestion": "stub suggestion: spell out the retry "
+                                      "policy"}],
+        "open_questions": [],
+        "fyi_notes": [],
+        "repos_touched": ["repoa"],
+        "strengths": ["stub strength: rollback path is concrete"],
+        "summary": "stub approves but wants one more polish round",
+    }
+elif mode == "approve" or (n >= 2):
     verdict = {
         "verdict": "approve",
         "objections": [],
@@ -57,6 +74,10 @@ if mode == "approve" or (n >= 2):
         "strengths": ["stub strength: rollback path is concrete"],
         "summary": "stub approval",
     }
+    if mode == "badjson":
+        # Pad the raw reply past the old 4000-char truncation so the e2e test
+        # can prove the full text is persisted.
+        verdict = dict(verdict, fyi_notes=["stub fyi padding: " + "x" * 4200])
 elif mode == "openq":
     verdict = {
         "verdict": "approve",

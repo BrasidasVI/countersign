@@ -96,9 +96,12 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
 Parse the last stdout line as JSON, surface any `warnings` in the report
 verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
 
-- **consensus** - Read the final plan. Tell the user three things: (1) what
-  changed between the first reviewed draft and the final plan (the
-  `<history_dir>/plan-v*.md` snapshots are the record); (2) what the reviewer
+- **consensus** - Consensus means the reviewer approved with ZERO objections
+  of any severity; improvement suggestions raised in earlier rounds were
+  incorporated by the drafter. Read the final plan. Tell the user three
+  things: (1) what changed between the first reviewed draft and the final
+  plan (the `<history_dir>/plan-v*.md` snapshots are the record, including
+  which reviewer suggestions were applied); (2) what the reviewer
   explicitly VALIDATED as strong (`strengths` in the report - the parts of
   the design that held up, so the user knows what not to second-guess);
   (3) any `fyi_notes` from the report. If `implement_attempted` is true,
@@ -124,8 +127,9 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   branch/worktree or it changed under you). Do NOT proceed. Re-locate the
   correct file, read it fresh, capture the new hash, tell the user what
   happened, and re-invoke with the new `--expect-sha256`.
-- **no-consensus** - Show the remaining blocking objections from the report
-  verbatim. Offer the user the real options: raise `--iterations`, revise
+- **no-consensus** - Show the remaining blocking AND minor objections from
+  the report verbatim (minors are improvement suggestions the reviewer still
+  wants made). Offer the user the real options: raise `--iterations`, revise
   the plan together in-chat first, or accept the disagreement and stop.
 - **error** - Show `error` from the report and the tail of the engine's
   stderr output; suggest the likely fix.

@@ -4,7 +4,8 @@ A Claude Code plugin that runs a two-agent consensus loop on a planning
 document: the interactive Claude session (which holds your conversation
 context) is the drafter of record; ZCode (GLM) reviews the plan headlessly;
 a headless claude session applies each revision — back and forth, fully
-self-driven, until the reviewer approves. Product decisions escalate to you
+self-driven, until the reviewer approves with zero outstanding objections.
+Product decisions escalate to you
 in the chat; nothing is ever committed or pushed automatically.
 
 ```
@@ -95,8 +96,11 @@ Optional flags:
    those two repos and nothing else.
 3. The loop runs, streaming progress (with a heartbeat) into the command
    output. Each iteration: GLM reviews → verdict parsed → blocking/minor
-   objections go to the revising claude → revised plan written in place
-   (snapshots in `<plan-dir>/.countersign/<plan>-history/`).
+   objections (each with a concrete suggested fix) go to the revising
+   claude → revised plan written in place (snapshots in
+   `<plan-dir>/.countersign/<plan>-history/`). Consensus requires a review
+   with zero objections of any severity: an approve-with-suggestions verdict
+   gets one more revise round instead of ending the loop.
 4. **Product/direction questions stop the loop** and appear in your chat
    with options and the reviewer's recommendation. Answer in plain text;
    the session records your decisions and resumes the loop automatically.

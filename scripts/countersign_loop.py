@@ -69,7 +69,7 @@ EXIT_NO_CONSENSUS = 3
 EXIT_BLOCKED_ON_HUMAN = 4
 EXIT_BLOCKED_ON_BRANCH = 5
 
-DEFAULT_MAX_ITERATIONS = 4
+DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_TIMEOUT_SECS = 900
 DEFAULT_HEARTBEAT_SECS = 30
 HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main()
@@ -492,21 +492,24 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "Respond with ONLY a single JSON object, no markdown fences, "
         "no prose before or after it:\n"
         '{"verdict": "approve" or "revise", '
-        '"objections": [{"severity": "blocking" or "minor", "point": "one sentence"}], '
+        '"objections": [{"severity": "blocking" or "minor", '
+        '"point": "1-3 sentences: what is wrong and why it matters", '
+        '"suggestion": "the concrete change that would resolve it"}], '
         '"strengths": ["what the plan does right and why it matters - concrete validation, not flattery"], '
         '"open_questions": [{"question": "a decision only the human product owner can make", '
         '"why": "what it affects", "options": ["realistic option", "..."], '
         '"recommendation": "your recommended option and one-line reason"}], '
-        '"fyi_notes": ["short observation the human should be aware of"], '
+        '"fyi_notes": ["observation the human should be aware of, 1-2 sentences"], '
         '"repos_touched": ["name of each repo under the workspace whose files the plan modifies"], '
-        '"summary": "one sentence overall assessment"}\n'
+        '"summary": "a few sentences of overall assessment"}\n'
         "\n"
         "Rules:\n"
         "- repos_touched must list every repo (by directory name) the plan's "
         "file-level changes live in - it drives which repos get implementation "
         "passes.\n"
-        '- verdict "approve" ONLY if there are zero blocking objections AND '
-        "open_questions is empty.\n"
+        '- verdict "approve" ONLY if there are zero objections of ANY severity '
+        "(blocking and minor) AND open_questions is empty. If you have minor "
+        'suggestions, verdict is "revise" and the drafter will address them.\n'
         "- Every objection must be concrete, actionable, and about the plan content.\n"
         "- Product and company-direction decisions (pricing, target users, scope, "
         "roadmap priorities, public commitments, vendor or cost commitments, legal "
@@ -518,7 +521,8 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "implications (e.g. reusing an existing integration path vs adding a new "
         "one) may be surfaced in fyi_notes so the human stays aware; fyi_notes "
         "never block consensus and never require a decision.\n"
-        "- Do not review style, only substance.\n"
+        "- Substance first, but do flag ambiguities, contradictions, or unclear "
+        "contracts that would force an implementer to guess.\n"
         "- strengths is positive validation for the HUMAN (what held up, so they "
         "stop second-guessing it) - it never affects the verdict and is never sent "
         "to the drafting agent. When you approve, list at least two concrete "
@@ -526,9 +530,12 @@ def build_review_prompt(plan_name: str, rules_text: str, brief_text: str = "",
         "- You are not just a gatekeeper: actively look for ways to IMPROVE the "
         "design - simpler alternatives, missed edge cases, a sharper test "
         "strategy, clearer contracts, better resilience or performance. Raise "
-        "each as a 'minor' objection with the concrete improvement (blocking "
-        "only if the plan's approach is materially deficient). Approving with "
-        "zero suggestions should mean you genuinely could not find any.\n"
+        "each as a 'minor' objection with the concrete improvement in "
+        "suggestion (blocking only if the plan's approach is materially "
+        "deficient). A thorough review with many suggestions beats a polite "
+        "short one; approving with zero suggestions must mean you genuinely "
+        "could not find any - but every suggestion must be one genuinely worth "
+        "making, not a nitpick invented to avoid approving.\n"
         "\n"
         "Required invariants - a plan that violates ANY of these MUST get verdict "
         '"revise" with the violation reported as a BLOCKING objection:\n'
@@ -558,8 +565,10 @@ def build_revise_prompt(plan_text: str, objections_json: str, brief_text: str = 
         f"=== REVIEWER OBJECTIONS (JSON) ===\n{objections_json}\n=== END OBJECTIONS ===\n"
         "\n"
         "Produce the COMPLETE revised plan document that resolves every blocking "
-        "objection and as many minor ones as is reasonable. Output only the revised "
-        "plan document itself, no commentary."
+        "objection and every minor objection. Where a minor objection seems "
+        "genuinely wrong, adjust the plan so the underlying concern is addressed "
+        "anyway rather than ignoring it. Output only the revised plan document "
+        "itself, no commentary."
     )
     if brief_text:
         base += "\n" + _brief_section(brief_text)
@@ -658,7 +667,11 @@ def parse_verdict(text: str) -> Verdict:
         if not point:
             continue
         # Unknown severity is counted as blocking: fail toward 'revise', never approval.
-        (minor if sev == "minor" else blocking).append({"severity": sev, "point": point})
+        entry = {"severity": sev, "point": point}
+        suggestion = str(ob.get("suggestion", "")).strip()
+        if suggestion:
+            entry["suggestion"] = suggestion
+        (minor if sev == "minor" else blocking).append(entry)
     open_questions = []
     for q in data.get("open_questions", []) or []:
         if not isinstance(q, dict):
@@ -693,9 +706,10 @@ def parse_verdict(text: str) -> Verdict:
             s = str(s).strip()
         if s:
             strengths.append(s)
-    # approve here covers objections only; the loop separately requires open_questions
-    # to be empty (via human resolution) before consensus is declared. fyi_notes and
-    # strengths deliberately never affect approval - awareness/validation only.
+    # approve here covers blocking objections and open questions only; the loop
+    # separately requires zero minor objections before declaring consensus (an
+    # approve-with-minors verdict sends those minors back for one more revise
+    # round). fyi_notes and strengths never affect approval - awareness only.
     approve = verdict == "approve" and not blocking and not open_questions
     return Verdict(approve, True, blocking, minor, open_questions, fyi_notes, strengths,
                    repos_touched, str(data.get("summary", "")), text)
@@ -907,13 +921,14 @@ def log_usage_estimate(cfg: Config, implement: bool) -> None:
     """Rough pre-run token budget so the human can decide whether to spend a
     5h/weekly coding-plan window on this run at all.
 
-    zcode numbers are measured on this setup (live review calls: ~13k input /
-    ~0.3k output each, roughly 80% cache-read). claude numbers are measured from
-    the first real claude-side run; refine as usage data accumulates.
+    zcode numbers are measured on this setup (live review calls: ~13k input each,
+    roughly 80% cache-read; output was ~0.3k before 0.3.0, ~1k now that reviews
+    carry full detail). claude numbers are measured from the first real
+    claude-side run; refine as usage data accumulates.
     """
     n = cfg.max_iterations
     log(f"usage ESTIMATE for up to {n} review cycle(s): "
-        f"zcode ~{n * 13_000:,} in / ~{n * 300:,} out (measured basis); "
+        f"zcode ~{n * 13_000:,} in / ~{n * 1_000:,} out (measured basis); "
         f"claude ~{n * 15_000:,} in / ~{n * 1_500:,} out (rough)")
     if cfg.fork_session_id:
         log("note: --fork re-sends the forked conversation's FULL context on every "
@@ -1011,7 +1026,7 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
                             "fyi_notes": verdict.fyi_notes,
                             "strengths": verdict.strengths,
                             "summary": verdict.summary, "sessionId": review.session_id,
-                            "raw": verdict.raw[:4000]},
+                            "raw": verdict.raw},
                            indent=2, ensure_ascii=False), encoding="utf-8")
         log(f"iteration {i}: verdict={'APPROVE' if verdict.approve else 'REVISE'} "
             f"({len(verdict.blocking)} blocking, {len(verdict.minor)} minor, "
@@ -1048,9 +1063,12 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
                     f"then re-runs with --decisions {oq_path}")
                 return EXIT_BLOCKED_ON_HUMAN
 
-        if verdict.approve:
+        if verdict.approve and not verdict.minor:
             consensus = True
             break
+        if verdict.approve and verdict.minor:
+            log(f"reviewer approves with {len(verdict.minor)} minor suggestion(s) - "
+                "consensus requires zero objections; one more revise round")
 
         if i == cfg.max_iterations:
             break
