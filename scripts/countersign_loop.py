@@ -84,12 +84,28 @@ class OrchestratorError(RuntimeError):
 # --------------------------------------------------------------------------
 
 def resolve_zcode_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
-    """Return the command prefix that launches the ZCode CLI, e.g. [node, zcode.cjs]."""
+    """Return the command prefix that launches the ZCode CLI, e.g. [node, zcode.cjs].
+
+    The headless CLI bundled with the ZCode desktop app is preferred on every
+    OS; a `zcode` on PATH is only a last resort (on Linux that is usually the
+    Electron desktop binary, which does not serve headless prompts - it spews
+    startup logs onto stdout and never emits the JSON reply).
+    """
     if explicit:
         return _zcode_explicit_cmd(explicit)
     here = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
     candidates = [
+        # Windows per-user install (electron-builder default)
         Path(here) / "Programs" / "ZCode" / "resources" / "glm" / "zcode.cjs",
+        # Windows machine-wide install
+        Path(program_files) / "ZCode" / "resources" / "glm" / "zcode.cjs",
+        # Linux installer (/opt is where the official package puts the app)
+        Path("/opt/ZCode/resources/glm/zcode.cjs"),
+        # macOS system-wide and per-user installs (Electron convention)
+        Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+        Path.home() / "Applications" / "ZCode.app" / "Contents" / "Resources" / "glm" / "zcode.cjs",
+        # Portable / manual placements
         Path.home() / ".zcode" / "cli" / "zcode.cjs",
     ]
     for c in candidates:
@@ -145,6 +161,76 @@ def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
         "from https://claude.ai/code and log in once ('claude' at a terminal), "
         "or pass --claude-cli <path>."
     )
+
+
+# The bundled headless CLI requires an explicit model provider in
+# ~/.zcode/cli/config.json before it will answer --prompt (the desktop app's
+# login alone is not enough). These are the documented defaults, verified
+# against ZCode 0.16.5; no secrets live here - the API key still flows via
+# ZCODE_API_KEY, which the engine extracts from the desktop app's config.
+ZCODE_CLI_CONFIG_DEFAULTS = {
+    "provider": {
+        "zai-coding-plan": {
+            "kind": "anthropic",
+            "options": {"baseURL": "https://api.z.ai/api/anthropic"},
+        }
+    },
+    "model": {"main": "zai-coding-plan/GLM-5.3"},
+}
+
+
+def _is_zcode_cli_config_error(stderr: str) -> bool:
+    """Recognize the bundled CLI's 'config incomplete' startup errors."""
+    s = stderr or ""
+    return "Model config is missing" in s or "is missing baseURL" in s
+
+
+def heal_zcode_cli_config() -> Optional[list]:
+    """Merge the documented model/provider defaults into ~/.zcode/cli/config.json.
+
+    Never overwrites existing values and never writes secrets. Returns the
+    list of keys added ([] when nothing was missing), or None when the file
+    could not be read or has an unexpected shape (in which case it is left
+    untouched for the human to fix).
+    """
+    path = Path.home() / ".zcode" / "cli" / "config.json"
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(cfg, dict):
+            return None
+        added = []
+        model = cfg.get("model")
+        if model is None:
+            cfg["model"] = {"main": ZCODE_CLI_CONFIG_DEFAULTS["model"]["main"]}
+            added.append("model.main")
+        elif isinstance(model, dict) and not model.get("main"):
+            model["main"] = ZCODE_CLI_CONFIG_DEFAULTS["model"]["main"]
+            added.append("model.main")
+        # a plain-string model ("provider/model") is already a valid pin; keep it
+        defaults_entry = ZCODE_CLI_CONFIG_DEFAULTS["provider"]["zai-coding-plan"]
+        provider = cfg.get("provider")
+        if provider is None:
+            provider = cfg["provider"] = {}
+        if isinstance(provider, dict):
+            entry = provider.get("zai-coding-plan")
+            if entry is None:
+                entry = provider["zai-coding-plan"] = {}
+            if isinstance(entry, dict):
+                if not entry.get("kind"):
+                    entry["kind"] = defaults_entry["kind"]
+                    added.append("provider.zai-coding-plan.kind")
+                opts = entry.get("options")
+                if opts is None:
+                    opts = entry["options"] = {}
+                if isinstance(opts, dict) and not opts.get("baseURL"):
+                    opts["baseURL"] = defaults_entry["options"]["baseURL"]
+                    added.append("provider.zai-coding-plan.options.baseURL")
+        if added:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return added
+    except (OSError, ValueError):
+        return None
 
 
 def zcode_api_key() -> Optional[str]:
@@ -404,6 +490,19 @@ def call_zcode(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = None,
         cfg=cfg, label="zcode")
 
 
+def _loads_cli_json(text: str) -> Optional[dict]:
+    """Parse CLI stdout that should be one JSON object; tolerate stray lines.
+
+    Strict parse first; fall back to brace-slicing so a stray log line on
+    stdout (e.g. an Electron app's startup logging) cannot kill an otherwise
+    good agent reply.
+    """
+    try:
+        return json.loads(text)
+    except ValueError:
+        return extract_json_object(text)
+
+
 def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = None,
                      session_id: Optional[str] = None, mode: str = "plan") -> AgentResult:
     cmd = cfg.zcode_cmd + [
@@ -417,9 +516,8 @@ def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = No
     proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra={"ZCODE_API_KEY": cfg.api_key or ""})
     if proc.returncode != 0:
         return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
-    try:
-        data = json.loads(proc.stdout)
-    except ValueError:
+    data = _loads_cli_json(proc.stdout)
+    if data is None:
         return AgentResult(ok=False, stderr="zcode stdout was not JSON: " + proc.stdout[:500])
     return AgentResult(
         ok=True,
@@ -453,17 +551,16 @@ def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] 
     proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra={}, stdin_text=prompt)
     if proc.returncode != 0:
         return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
-    try:
-        data = json.loads(proc.stdout)
+    data = _loads_cli_json(proc.stdout)
+    if data is not None:
         return AgentResult(
             ok=True,
             text=data.get("result", ""),
             session_id=data.get("session_id"),
             usage=data.get("usage", {}) or {},
         )
-    except ValueError:
-        # Non-JSON stdout: treat the whole stdout as the result text.
-        return AgentResult(ok=True, text=proc.stdout.strip())
+    # Non-JSON stdout: treat the whole stdout as the result text.
+    return AgentResult(ok=True, text=proc.stdout.strip())
 
 
 def _preview_cmd(cmd: list[str]) -> str:
@@ -1358,6 +1455,17 @@ def preflight(cfg: Config, report: RunReport) -> int:
             log("  no ZCODE_API_KEY and none found in ~/.zcode/v2/config.json")
         z = safe(call_zcode, "Reply with exactly the word OK and nothing else.",
                  cwd=probe_cwd, cfg=cfg, mode="plan")
+        if not z.ok and _is_zcode_cli_config_error(z.stderr):
+            # First run on a fresh device: the bundled CLI needs its model
+            # provider config and nobody has written it yet. Merge the
+            # documented defaults (never overwriting, never storing secrets)
+            # and re-probe so first use just works.
+            healed = heal_zcode_cli_config()
+            if healed:
+                log("  healed ~/.zcode/cli/config.json (added: "
+                    + ", ".join(healed) + "); retrying probe")
+                z = safe(call_zcode, "Reply with exactly the word OK and nothing else.",
+                         cwd=probe_cwd, cfg=cfg, mode="plan")
         if z.ok and z.text.strip():
             sid = "present" if z.session_id else "MISSING"
             log(f"  headless prompt OK (response={z.text.strip()[:30]!r}, sessionId={sid})")

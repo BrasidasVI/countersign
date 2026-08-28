@@ -43,11 +43,14 @@ First use on a device: `/countersign` runs a one-time preflight (two tiny
 claude calls + one tiny zcode call) that verifies both CLIs, then asks for
 the repo paths involved (saved to `~/.countersign/config.json`).
 
-### ZCode headless config (one-time quirk)
+### ZCode headless config (handled automatically)
 
 The headless CLI reads `~/.zcode/cli/config.json`, separate from the
-desktop app's own config (known ZCode 0.16.3 behavior). Minimal working
-example:
+desktop app's own config (known ZCode 0.16.x behavior), and refuses to run
+until a model provider is declared there. Since 0.3.1 the preflight detects
+that condition on a fresh device, merges the defaults below into the file
+(never overwriting existing values, never storing secrets), and retries —
+so first use needs no manual setup. The merged content is:
 
 ```json
 {
@@ -64,6 +67,13 @@ example:
 Note `model.main` must be the STRING `"provider/model"`. The API key comes
 from the `ZCODE_API_KEY` environment variable, or auto-loads from the ZCode
 desktop app's config (`~/.zcode/v2/config.json`) if you're logged in there.
+
+The engine locates the bundled CLI (`zcode.cjs`) automatically on Windows
+(per-user and machine-wide installs), Linux (`/opt/ZCode`), and macOS
+(`/Applications` and `~/Applications`); a `zcode` found on PATH is only a
+last resort — on Linux that is the Electron desktop binary, which does not
+serve headless prompts. Nonstandard install location? Pass
+`--zcode-cli <path to zcode.cjs>`.
 
 ## Use
 
