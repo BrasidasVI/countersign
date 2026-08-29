@@ -964,22 +964,35 @@ def _git_identity(p: Path) -> Optional[str]:
 
 
 def check_plan_repo_consistency(plan_path: Path, link_repos: list) -> list:
-    """Warn when the plan's repo is the SAME repository as a linked repo but a
-    DIFFERENT checkout (e.g. plan read from a worktree based on an old commit
-    while the agents review the real checkout on another branch). Content can
-    match while the surrounding code differs - the review would then judge the
-    plan against code it wasn't written against. Returns warning strings."""
+    """Guards against reviewing a plan against the wrong code. Two cases, both
+    warnings (the human decides whether to proceed):
+
+    1. The plan's repo is the SAME repository as a linked repo but a DIFFERENT
+       checkout (e.g. plan read from a worktree based on an old commit while
+       the agents review the real checkout on another branch). Content can
+       match while the surrounding code differs.
+    2. The plan's own repository is entirely ABSENT from the linked repos -
+       e.g. a repo set left over from another project. The agents cannot see
+       the code the plan targets at all, and an implement pass would default
+       to editing the linked (wrong) repos.
+
+    Returns warning strings."""
     warnings = []
     plan_root = _git_repo_root(plan_path.parent)
     if plan_root is None or not link_repos:
         return warnings
     plan_ident = _git_identity(plan_root)
     _, plan_commit = _git_context(plan_root)
+    plan_repo_linked = False
     for lr in link_repos:
         lroot = _git_repo_root(Path(lr))
-        if lroot is None or lroot.resolve() == plan_root.resolve():
+        if lroot is None:
+            continue
+        if lroot.resolve() == plan_root.resolve():
+            plan_repo_linked = True
             continue
         if plan_ident and _git_identity(lroot) == plan_ident:
+            plan_repo_linked = True   # a checkout of the plan's repo IS present
             _, lcommit = _git_context(lroot)
             if lcommit != plan_commit:
                 w = (f"plan repo checkout mismatch: the plan lives in "
@@ -988,6 +1001,14 @@ def check_plan_repo_consistency(plan_path: Path, link_repos: list) -> list:
                      "different checkouts (worktree?). The review may judge the "
                      "plan against code it was not written against.")
                 warnings.append(w)
+    if not plan_repo_linked:
+        warnings.append(
+            f"plan repo not in workspace: the plan lives in {plan_root} but "
+            f"the agents will only see {', '.join(str(Path(lr)) for lr in link_repos)}. "
+            "The review cannot check the plan against the code it targets, and "
+            "an implement pass would edit the linked repos instead of the "
+            "plan's own. Fix the project's repo set (or --link-repo flags) "
+            "unless the plan deliberately lives outside the reviewed repos.")
     return warnings
 
 

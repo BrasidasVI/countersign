@@ -1,5 +1,5 @@
 {
   "name": "countersign",
   "description": "Dual-agent consensus on planning docs: ZCode (GLM) reviews, headless Claude revises, loops until consensus. The interactive session stays the drafter of record and mediates all human decisions.",
-  "version": "0.3.1"
+  "version": "0.4.0"
 }

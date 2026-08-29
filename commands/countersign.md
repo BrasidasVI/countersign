@@ -1,6 +1,6 @@
 ---
 description: Dual-agent consensus on a planning doc - GLM reviews, headless Claude revises, loop until consensus
-argument-hint: <plan-file.md> [--implement] [--fork] [--iterations N]
+argument-hint: <plan-file.md> [--implement] [--fork] [--iterations N] [--repos A,B]
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
@@ -14,8 +14,9 @@ after: mediate results and human decisions back into this chat.
 
 Arguments: `$ARGUMENTS`
 Parse them: one plan file path (required), plus optional flags
-`--implement`, `--fork`, `--iterations N`. If no plan path is given, ask the
-user which planning document to review before doing anything else.
+`--implement`, `--fork`, `--iterations N`, `--repos <p1>,<p2>,...`. If no plan
+path is given, ask the user which planning document to review before doing
+anything else.
 
 ## Step 1 - locate and verify the plan
 
@@ -37,16 +38,47 @@ user which planning document to review before doing anything else.
 
 ## Step 2 - device setup (once per device)
 
-- Check for `~/.countersign/config.json`. If missing (or lacking a `repos`
-  array), ask the user for the repository paths involved in this plan
-  (typically a backend and a frontend repo, absolute paths), then write:
-  `{ "repos": ["<abs path 1>", "<abs path 2>"] }`.
 - Check for `~/.countersign/preflight-ok`. If missing, run the engine once
   with `--preflight` first (see command shape below, replacing the plan file
   with `--preflight x`). On success, write the marker file. On failure, show
   the user the failures and stop - do not run the loop.
+- Nothing else is device-global. Repo sets are PER PROJECT (Step 3): never
+  write or consult a device-wide repo list - applying one project's repos to
+  another project's plan links the wrong code.
 
-## Step 3 - write the context brief
+## Step 3 - resolve the repo set for THIS plan
+
+- Find the plan's repo root:
+  `git -C "<plan dir>" rev-parse --show-toplevel` (empty output means the
+  plan is not inside a git repository).
+- If the user passed `--repos <p1>,<p2>,...`: expand `~`, resolve each to an
+  absolute path, and use exactly those for this run. Additionally, if the
+  plan's repo root IS among them AND no existing project entry (see below)
+  already contains the plan's repo root, remember the set: read
+  `~/.countersign/config.json` (create `{}` if missing), ensure a `projects`
+  object, store `{"repos": ["<abs path>", ...]}` under a key named after the
+  plan repo root's directory (e.g. `ladderly_backend`), and tell the user in
+  one line that the set was remembered for this project. Never persist when
+  an entry already covers the repo - a later `--repos` on a known project is
+  a deliberate one-off override, not a redefinition.
+- Else read `~/.countersign/config.json`. If it has a `projects` object,
+  resolve each entry's `repos` and use the FIRST entry whose list contains
+  the plan's repo root: `REPOS` = that entry's full list. Membership, not
+  direction: a plan written in the backend repo of a backend+frontend
+  project resolves to BOTH repos, and so does one written in the frontend.
+- Legacy migration: if the config has a flat `repos` array and no `projects`
+  object, rewrite it in place as
+  `{"projects": {"migrated": {"repos": <that array>}}}` and tell the user in
+  one line. The old flat array applied one repo set to every plan on the
+  device, which linked the wrong repos when switching projects.
+- Otherwise (no config, or no entry contains the plan's repo root):
+  `REPOS` = the plan's repo root ALONE. Do not ask the user anything and do
+  not mention other projects' repos - a plan in an unconfigured repo is
+  reviewed against exactly that repo. If the plan is not inside a git
+  repository at all, pass no `--link-repo` flags (the engine then uses the
+  session's working directory as the workspace).
+
+## Step 4 - write the context brief
 
 This is how the headless agents inherit THIS conversation's context cheaply.
 Write `<plan-dir>/.countersign/<plan-stem>-context-brief.md` (create the
@@ -66,7 +98,7 @@ If this conversation has no relevant context (the plan was handed to you
 cold), derive the brief from the plan's own Goal/Non-goals sections and say
 so in the brief.
 
-## Step 4 - run the engine
+## Step 5 - run the engine
 
 Build and run with Bash (adjust flags from the parsed arguments):
 
@@ -81,7 +113,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
   [--max-iterations N (only when --iterations given)]
 ```
 
-- `${REPOS[@]}` are the entries from `~/.countersign/config.json`.
+- `${REPOS[@]}` are the repo paths resolved in Step 3.
 - If the plan's repo root (walk up from the plan file to the containing git
   repository) has an `agent-review-rules.md`, also pass
   `--review-rules "<that file>"`.
@@ -91,7 +123,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
 - `--fork` costs more on every revise call (it re-sends this whole
   conversation's context) - only use it when the user asked for it.
 
-## Step 5 - mediate the outcome
+## Step 6 - mediate the outcome
 
 Parse the last stdout line as JSON, surface any `warnings` in the report
 verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:

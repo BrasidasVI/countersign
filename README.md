@@ -40,8 +40,9 @@ Requires: Claude Code (claude CLI logged in), the ZCode desktop app
 `/plugin marketplace add /path/to/countersign`.)
 
 First use on a device: `/countersign` runs a one-time preflight (two tiny
-claude calls + one tiny zcode call) that verifies both CLIs, then asks for
-the repo paths involved (saved to `~/.countersign/config.json`).
+claude calls + one tiny zcode call) that verifies both CLIs. After that the
+plugin works in any repo on the device — repo sets are resolved per plan,
+not per device (see [Multiple projects on one device](#multiple-projects-on-one-device)).
 
 ### ZCode headless config (handled automatically)
 
@@ -95,6 +96,10 @@ Optional flags:
   windows and rarely worth it for long chats. Default is a short
   context-brief file the session writes before the loop.
 - `--iterations N` — raise the per-invocation review cap (default 4).
+- `--repos A,B` — review against exactly these repos for this run. When the
+  plan lives in one of them and the project isn't known yet, the set is
+  remembered for that project (see below); on a known project it acts as a
+  one-off override and nothing is rewritten.
 
 ### What happens when you invoke it
 
@@ -102,8 +107,9 @@ Optional flags:
    already made in-chat, out of scope) next to the plan — this is how the
    headless agents inherit your conversation cheaply.
 2. The engine builds a **synthetic workspace** (`~/.countersign/ws/<hash>/`)
-   containing links to exactly the repos you configured — both agents see
-   those two repos and nothing else.
+   containing links to exactly the repos resolved for this plan's project —
+   by default the one repo the plan lives in. The agents see those and
+   nothing else; repos from other projects are never linked or mentioned.
 3. The loop runs, streaming progress (with a heartbeat) into the command
    output. Each iteration: GLM reviews → verdict parsed → blocking/minor
    objections (each with a concrete suggested fix) go to the revising
@@ -126,6 +132,45 @@ Optional flags:
   sessions) — re-running later continues from the last iteration instead of
   re-spending the earlier ones.
 - `--implement` is the budget-dominating pass; it is opt-in for that reason.
+
+## Multiple projects on one device
+
+Repo sets are per project, never per device. Resolution order:
+
+1. **Default — zero configuration:** the workspace links exactly the git repo
+   the plan file lives in. `/countersign docs/plans/foo.md` in any new repo
+   works on first try; nothing from other projects is linked or mentioned.
+2. **Multi-repo projects:** when a plan spans repos (e.g. a backend +
+   frontend pair), declare the set once:
+
+   ```
+   /countersign plan.md --repos ~/Documents/ladderly_backend,~/Documents/ladderly_frontend
+   ```
+
+   The set is saved to `~/.countersign/config.json` and matched by
+   membership: a plan written in either member repo resolves to the whole
+   set, so backend plans see the frontend and vice versa. Keys are just
+   labels; matching is on resolved repo paths:
+
+   ```json
+   {
+     "projects": {
+       "ladderly": {
+         "repos": ["~/Documents/ladderly_backend", "~/Documents/ladderly_frontend"]
+       }
+     }
+   }
+   ```
+
+   A `--repos` on a project that's already known is a deliberate one-off
+   override (e.g. narrow a backend-only plan) and does not rewrite the saved
+   entry.
+3. **Safety net:** if the plan's own repository ends up absent from the
+   resolved workspace (stale config, wrong paths), the run emits a loud
+   warning that the chat surfaces verbatim. The old flat device-wide `repos`
+   array (pre-0.4) is migrated into a project entry on first use — it applied
+   one repo set to every plan on the device, which linked the wrong repos
+   when switching projects.
 
 ## Project review rules (per repo, versioned with the code)
 

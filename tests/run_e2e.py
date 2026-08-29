@@ -10,6 +10,9 @@ Scenarios (sequential, each with its own plan file and fake repos):
   I. approve-with-minors: approve + minor suggestion => NOT consensus yet, one
                          more revise round, then consensus; the suggestion
                          reaches the drafter and the review artifact
+  J. absent plan repo   : plan's repo not among --link-repos => run continues
+                         but a loud warning lands in the report (stale-config
+                         guard; implement would otherwise target the wrong repos)
 """
 import json
 import os
@@ -238,7 +241,16 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
           rj1["minor"][0].get("suggestion") == "stub suggestion: spell out the retry policy",
           json.dumps(rj1["minor"]))
 
-    # junction workspace must expose ONLY the linked repos
-    ws = Path(rep["history_dir"])  # not the ws; find via ~/.countersign
+    print("scenario J: plan repo absent from the workspace warns (stale config guard)")
+    repoC = T / "repoc"
+    make_repo(repoC, "dev")
+    planJ = make_plan(repoC, "plan-j.md", "# Plan J\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planJ, [repoA, repoB], stub_mode="approve")
+    check("still runs (warning, not block)",
+          rc == 0 and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("absence warned",
+          any("plan repo not in workspace" in w for w in rep.get("warnings", [])),
+          str(rep.get("warnings"))[:160])
+
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
     sys.exit(1 if failures else 0)
