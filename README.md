@@ -189,7 +189,7 @@ example.
 |---|---|
 | `commands/countersign.md` | The `/countersign` command: instructions the interactive session follows. |
 | `scripts/countersign_loop.py` | The engine: agent invocation, verdict parsing, retries/rate limits, implement passes. Full design doc in its docstring. |
-| `tests/run_e2e.py` | End-to-end engine test with stub agents (zero model spend): `python tests/run_e2e.py` |
+| `tests/run_e2e.py` | End-to-end engine test with stub agents (zero model spend): `python3 tests/run_e2e.py` |
 
 ## Migrating from the terminal launcher (v0.1)
 

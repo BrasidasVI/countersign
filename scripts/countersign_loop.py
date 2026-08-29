@@ -16,7 +16,7 @@ Input contract: the plan document ALREADY EXISTS on disk (the interactive
 session wrote it). This engine never drafts from scratch.
 
 Invocation (what the plugin command runs):
-  python countersign_loop.py PLAN.md \
+  python3 countersign_loop.py PLAN.md \
       --link-repo <backend> --link-repo <frontend> \
       [--context-brief brief.md] [--decisions decisions.json] \
       [--fork-session-id <sid>] [--implement] [--max-iterations N] ...

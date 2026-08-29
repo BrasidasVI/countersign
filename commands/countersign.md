@@ -104,7 +104,8 @@ Build and run with Bash (adjust flags from the parsed arguments):
 
 ```bash
 NONCE="cs-$(date +%s)-$RANDOM$RANDOM"
-python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
+PYTHON="$(command -v python3 || command -v python)"
+"$PYTHON" "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
   --expect-sha256 "<hash you captured when reading the plan>" \
   --fork-invocation-nonce "$NONCE" \
   $(printf -- '--link-repo %q ' "${REPOS[@]}") \
