@@ -13,9 +13,27 @@ Scenarios (sequential, each with its own plan file and fake repos):
   J. absent plan repo   : plan's repo not among --link-repos => run continues
                          but a loud warning lands in the report (stale-config
                          guard; implement would otherwise target the wrong repos)
+  K. cumulative decisions: round 1 asks Q1+Q2; round 2's decisions.json is a
+                         DELTA answering only Q1; reviewer re-asks both; round
+                         3 answers only Q2 => engine must still hold Q1 settled,
+                         reach a revise that bakes BOTH into the plan, consensus
+  L. truncation recovery : first revise reply is a tiny prefix of the plan =>
+                         refused, re-asked once, full revision accepted; content
+                         preserved; consensus
+  M. hard truncation    : EVERY revise reply truncated => outcome
+                         revise-truncated, plan file byte-identical to the
+                         original, nothing snapshotted as a revision
+  N. fork plumbing      : --fork-session-id (now the default mode) => first
+                         revise call forks, session chains, fork recorded in
+                         the report and stderr; consensus still reached
+  O. nonce fork target  : --fork-invocation-nonce => the engine forks the
+                         transcript CONTAINING the nonce, even when a
+                         different (newer-mtime) transcript exists in the
+                         same project directory
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,14 +52,21 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def run_engine(plan, repos, extra=(), stub_mode="revise"):
+def run_engine(plan, repos, extra=(), stub_mode="revise", no_fork=True,
+               env_extra=None):
     env = dict(os.environ,
                CS_STUB_MODE=stub_mode,
                CS_STUB_STATE_DIR=str(STATE_DIR),
                CS_DISABLE_POWERSHELL_JUNCTION="1")  # unused; placeholder symmetry
+    env.update(env_extra or {})
     cmd = [PY, str(ENGINE), str(plan),
            "--claude-cli", str(STUB_CLAUDE), "--zcode-cli", str(STUB_ZCODE),
-           "--heartbeat", "0", "--max-retries", "0", *extra]
+           "--heartbeat", "0", "--max-retries", "0"]
+    if no_fork:
+        # keeps the suite hermetic: the engine's fork-by-default would
+        # otherwise auto-discover REAL session transcripts on this machine
+        cmd += ["--no-fork"]
+    cmd += list(extra)
     for r in repos:
         cmd += ["--link-repo", str(r)]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -251,6 +276,120 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("absence warned",
           any("plan repo not in workspace" in w for w in rep.get("warnings", [])),
           str(rep.get("warnings"))[:160])
+
+    print("scenario K: decisions accumulate across blocked-on-human rounds")
+    planK = make_plan(repoA, "plan-k.md", "# Plan K\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planK, [repoA, repoB], stub_mode="openq2")
+    check("round 1 blocked", rc == 4 and rep.get("outcome") == "blocked-on-human",
+          f"rc={rc}")
+    qs = json.loads(Path(rep["open_questions_file"]).read_text(encoding="utf-8"))
+    check("round 1 asked both questions", len(qs) == 2, str(len(qs)))
+    # Round 2: the session answers ONLY Q1 (decisions.json as a delta); the
+    # reviewer returns BOTH questions again - the engine must filter Q1 as
+    # settled and block with just Q2, without forgetting Q1.
+    qs[0]["answer"] = "free tier"
+    dec1 = Path(rep["history_dir"]) / "decisions.json"
+    dec1.write_text(json.dumps(qs[:1], indent=2), encoding="utf-8")
+    rc, rep, err = run_engine(planK, [repoA, repoB],
+                              extra=["--decisions", str(dec1)], stub_mode="openq2")
+    check("round 2 blocked", rc == 4 and rep.get("outcome") == "blocked-on-human",
+          f"rc={rc}")
+    qs2 = json.loads(Path(rep["open_questions_file"]).read_text(encoding="utf-8"))
+    check("settled question NOT re-asked",
+          len(qs2) == 1 and "Q2" in qs2[0]["question"], json.dumps(qs2)[:120])
+    check("round 1 answer still settled",
+          rep.get("decisions", {}).get("Q1: ship the stub feature free or Pro-only?")
+          == "free tier",
+          json.dumps(rep.get("decisions"))[:160])
+    # Round 3: the session answers ONLY Q2 as a fresh delta file - the exact
+    # spot where the old engine lost Q1. Merge must hold BOTH; the revise pass
+    # then bakes them into the plan before consensus.
+    qs2[0]["answer"] = "dark mode ships"
+    dec2 = Path(rep["history_dir"]) / "decisions-2.json"
+    dec2.write_text(json.dumps(qs2, indent=2), encoding="utf-8")
+    rc, rep, err = run_engine(planK, [repoA, repoB],
+                              extra=["--decisions", str(dec2)], stub_mode="openq2")
+    check("round 3 consensus after revise", rc == 0
+          and rep.get("outcome") == "consensus" and rep.get("iterations_used") == 2,
+          f"rc={rc}")
+    check("decisions cumulative in report", len(rep.get("decisions", {})) == 2,
+          json.dumps(rep.get("decisions"))[:200])
+    check("plan revised with BOTH decisions",
+          "free tier" in planK.read_text(encoding="utf-8")
+          and "dark mode ships" in planK.read_text(encoding="utf-8"))
+    settled_file = json.loads((Path(rep["history_dir"]) / "settled-decisions.json")
+                              .read_text(encoding="utf-8"))
+    check("settled-decisions.json persisted with both answers",
+          len(settled_file) == 2, json.dumps(settled_file)[:160])
+
+    print("scenario L: truncated revise reply refused, re-ask recovers")
+    planL = make_plan(repoA, "plan-l.md", "# Plan L\n\nGoal: stub goal.\n")
+    planL_text = planL.read_text(encoding="utf-8")
+    rc, rep, err = run_engine(planL, [repoA, repoB], stub_mode="truncate")
+    check("consensus after truncation recovery", rc == 0
+          and rep.get("outcome") == "consensus" and rep.get("iterations_used") == 2,
+          f"rc={rc}")
+    finalL = planL.read_text(encoding="utf-8")
+    check("full revision accepted on re-ask", "Stub revision" in finalL)
+    check("original content preserved (no silent shrink)",
+          all(ln in finalL for ln in planL_text.strip().splitlines()))
+    check("drafter called twice (refused reply + re-ask)",
+          rep.get("usage", {}).get("claude", {}).get("input_tokens") == 1000,
+          json.dumps(rep.get("usage", {})))
+
+    print("scenario M: persistent truncation refuses without corrupting")
+    planM = make_plan(repoA, "plan-m.md", "# Plan M\n\nGoal: stub goal.\n")
+    planM_text = planM.read_text(encoding="utf-8")
+    rc, rep, err = run_engine(planM, [repoA, repoB], stub_mode="truncate2")
+    check("exit code 2", rc == 2, f"rc={rc}")
+    check("outcome revise-truncated", rep and rep.get("outcome") == "revise-truncated",
+          str(rep)[:120])
+    check("error names the truncation", "truncat" in str(rep.get("error", "")).lower())
+    check("plan file byte-identical (not corrupted)",
+          planM.read_text(encoding="utf-8") == planM_text)
+    check("no revision snapshot written",
+          not list(Path(rep["history_dir"]).glob("plan-v*.md")))
+
+    print("scenario N: forked-conversation revise calls (default mode plumbing)")
+    planN = make_plan(repoA, "plan-n.md", "# Plan N\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planN, [repoA, repoB],
+                              extra=["--fork-session-id", "sess-fork-abc123"],
+                              stub_mode="revise", no_fork=False)
+    check("fork run reaches consensus", rc == 0 and rep.get("outcome") == "consensus",
+          f"rc={rc}")
+    check("fork recorded in report", rep.get("forked_from_session") == "sess-fork-abc123",
+          str(rep.get("forked_from_session")))
+    check("fork logged on stderr", "forked from" in err)
+    check("plan revised through the fork",
+          "Stub revision" in planN.read_text(encoding="utf-8"))
+
+    print("scenario O: fork target derived from invocation nonce, not mtime")
+    fake_home = T / "fakehome"
+    proj = (fake_home / ".claude" / "projects"
+            / re.sub(r"[^A-Za-z0-9-]", "-", str(Path.cwd())))
+    proj.mkdir(parents=True, exist_ok=True)
+    current = proj / "bbbb-current.jsonl"     # the chat that invoked the run
+    current.write_text(
+        json.dumps({"sessionId": "sess-NONCE-0002"}) + "\n"
+        + json.dumps({"tool_use": "countersign --fork-invocation-nonce cs-nonce-42"}) + "\n",
+        encoding="utf-8")
+    import time as _time
+    old = _time.time() - 3600
+    os.utime(current, (old, old))            # older: mtime alone would NOT pick it
+    stale = proj / "aaaa-stale.jsonl"        # newest by mtime, but NOT the invoker
+    stale.write_text(json.dumps({"sessionId": "sess-STALE-0001"}) + "\n",
+                     encoding="utf-8")
+    planO = make_plan(repoA, "plan-o.md", "# Plan O\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planO, [repoA, repoB],
+                              extra=["--fork-invocation-nonce", "cs-nonce-42"],
+                              stub_mode="revise", no_fork=False,
+                              env_extra={"HOME": str(fake_home)})
+    check("nonce run reaches consensus", rc == 0
+          and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("forked the NONCE session (not the newest transcript)",
+          rep.get("forked_from_session") == "sess-NONCE-0002",
+          str(rep.get("forked_from_session")))
+    check("nonce match logged", "nonce" in err.lower())
 
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
     sys.exit(1 if failures else 0)

@@ -27,11 +27,17 @@ Output contract (stable, machine-read by the plugin command):
   - exit codes: 0 consensus | 2 error/rate-limited | 3 no-consensus |
     4 blocked-on-human (questions need answers -> --decisions) |
     5 blocked-on-branch (implement target on main/master; nothing edited).
+  - a revise reply that is a fraction of the plan's size is treated as a
+    truncated output turn: one re-ask, then outcome "revise-truncated" with
+    the plan file left untouched at its last good state.
 
 Human-in-the-loop surfaces (all mediated by the interactive session):
   - Open questions (product/company decisions): the loop STOPS, exit 4,
     questions land in <history>/open-questions.json; the chat collects the
     human's answers, writes decisions.json, re-runs with --decisions.
+    Answers are CUMULATIVE across rounds: settled decisions persist in
+    <history>/settled-decisions.json and merge with the --decisions file
+    (same question in both: the file's answer wins).
   - Branch safety: implement passes refuse main/master before any edit.
   - Git: nothing is ever committed or pushed by this engine.
 
@@ -41,8 +47,11 @@ Usage limits (Claude Pro / z.ai 5h+weekly windows):
     persisted (plan snapshots + sessions in <history>) so a later re-run
     continues rather than re-spending earlier iterations.
   - a pre-run cost estimate is logged; per-agent token totals are reported.
-  - --fork-session-id re-sends the forked conversation's full context on
-    EVERY revise call - opt in per run, it multiplies claude-side cost.
+  - revise calls FORK the interactive conversation by default (the invoking
+    chat identified exactly via --fork-invocation-nonce, falling back to the
+    newest transcript; full context inherited once, then the fork is resumed
+    incrementally) instead of re-sending a reconstructed plan+brief on every
+    call; --no-fork restores fresh revise sessions.
 """
 
 from __future__ import annotations
@@ -73,6 +82,24 @@ DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_TIMEOUT_SECS = 900
 DEFAULT_HEARTBEAT_SECS = 30
 HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main()
+
+# A revise pass must re-emit the COMPLETE document (the prompt says so); the
+# protocol never licenses removal. Live runs on a ~158KB plan showed the
+# drafting agent's output turn truncating silently (1677 -> 626 lines, whole
+# mechanisms gone) - the next review then flagged the lost content as gaps.
+# Below REFUSE a "revision" is never written; between WARN and REFUSE, lost
+# section headings are surfaced to the human instead.
+REVISE_SHRINK_REFUSE_RATIO = 0.60
+REVISE_SHRINK_WARN_RATIO = 0.85
+REVISE_FEASIBILITY_WARN_CHARS = 100_000   # ~25k output tokens per revise turn
+REVISE_TIMEOUT_STEP_CHARS = 40_000        # one extra --timeout per this many chars
+REVISE_TIMEOUT_MAX_MULTIPLE = 6
+TRUNCATION_RETRY_NOTE = (
+    "\n\nIMPORTANT: your PREVIOUS reply was TRUNCATED - it was only a fraction "
+    "of the length of the current plan. Output the COMPLETE revised plan "
+    "document: every section, nothing omitted, no summaries in place of "
+    "content. If the document is too long for one reply, say so explicitly "
+    "instead of silently cutting it.")
 
 
 class OrchestratorError(RuntimeError):
@@ -321,21 +348,43 @@ def build_workspace(repo_paths: list[Path]) -> Path:
     return ws
 
 
-def discover_current_claude_session(cwd: Path) -> Optional[str]:
-    """Best-effort session ID of the CURRENT interactive Claude Code session.
+def discover_current_claude_session(cwd: Path,
+                                    nonce: Optional[str] = None) -> Optional[str]:
+    """Session ID of the interactive Claude Code session that invoked this run.
 
     Claude Code stores one transcript per session at
-    ~/.claude/projects/<cwd with non-alphanumerics as '-'>/<session-uuid>.jsonl;
-    the live session's transcript is the most recently modified one. Used by
-    --fork-current-session so the headless revise sessions can fork this
-    conversation's context. Returns None when nothing plausible is found."""
+    ~/.claude/projects/<cwd with non-alphanumerics as '-'>/<session-uuid>.jsonl.
+
+    With a nonce: return the session whose transcript CONTAINS it. The plugin
+    command embeds a unique nonce in this engine's own command line, and that
+    command line is recorded in the invoking chat's transcript before the
+    engine runs - so a nonce match identifies the invoking chat exactly, with
+    no newest-transcript guesswork (two sessions in one repo can otherwise
+    fork the wrong conversation).
+
+    Without a nonce: fall back to the most recently modified transcript
+    (best-effort). Returns None when nothing plausible is found."""
     root = Path.home() / ".claude" / "projects"
     encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd))
     proj = root / encoded
     if not proj.is_dir():
         return None
+    transcripts = sorted(proj.glob("*.jsonl"))
+    if nonce:
+        for t in transcripts:
+            try:
+                text = t.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if nonce in text:
+                try:
+                    sid = json.loads(text.splitlines()[0]).get("sessionId")
+                    return str(sid) if sid else None
+                except (OSError, IndexError, ValueError):
+                    return None
+        return None
     try:
-        newest = max(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        newest = max(transcripts, key=lambda p: p.stat().st_mtime)
     except ValueError:
         return None
     try:
@@ -528,15 +577,18 @@ def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = No
 
 
 def call_claude(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] = None,
-                permission_mode: str = "plan", fork: bool = False) -> AgentResult:
+                permission_mode: str = "plan", fork: bool = False,
+                timeout: Optional[int] = None) -> AgentResult:
     return _invoke_with_retries(
         lambda: _call_claude_once(prompt, cwd=cwd, cfg=cfg, session_id=session_id,
-                                  permission_mode=permission_mode, fork=fork),
+                                  permission_mode=permission_mode, fork=fork,
+                                  timeout=timeout),
         cfg=cfg, label="claude")
 
 
 def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] = None,
-                      permission_mode: str = "plan", fork: bool = False) -> AgentResult:
+                      permission_mode: str = "plan", fork: bool = False,
+                      timeout: Optional[int] = None) -> AgentResult:
     # Prompt goes via stdin: plan documents can exceed Windows argv limits.
     cmd = cfg.claude_cmd + ["-p", "--output-format", "json"]
     if permission_mode:
@@ -548,7 +600,7 @@ def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] 
             # calls inherit an interactive conversation's context without ever
             # touching the live session. Available since Claude Code 2.1.x.
             cmd += ["--fork-session"]
-    proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra={}, stdin_text=prompt)
+    proc = _run(cmd, timeout=timeout or cfg.timeout, cwd=cwd, env_extra={}, stdin_text=prompt)
     if proc.returncode != 0:
         return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
     data = _loads_cli_json(proc.stdout)
@@ -746,6 +798,57 @@ class Verdict:
     raw: str
 
 
+@dataclass
+class RevisionGate:
+    refused: bool
+    detail: str = ""
+    warnings: list = field(default_factory=list)
+
+
+def _markdown_headings(text: str) -> set:
+    """Normalized section headings, ignoring fenced code blocks."""
+    out, in_fence = set(), False
+    for ln in text.splitlines():
+        stripped = ln.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and stripped.startswith("#"):
+            title = re.sub(r"\s+", " ", stripped.lstrip("#").strip()).strip().lower()
+            if title:
+                out.add(title)
+    return out
+
+
+def check_revision_preserves_content(old: str, new: str) -> RevisionGate:
+    """A revise pass re-emits the COMPLETE plan; nothing in the protocol
+    licenses removal. A 'revision' that is a small fraction of the old size,
+    or that drops whole sections, is a truncated output turn until proven
+    otherwise - the failure looks identical to a legitimate tighten pass, so
+    the gate errs toward refusal: large removals are the HUMAN's edit to make
+    in-chat, never the loop's. Refused output is never written; the plan
+    stays at its last good state (plan-v*.md snapshots are the record)."""
+    if not old or not new:
+        return RevisionGate(False)
+    ratio = len(new) / len(old)
+    warnings = []
+    if ratio < REVISE_SHRINK_WARN_RATIO:
+        lost = sorted(_markdown_headings(old) - _markdown_headings(new))
+        if lost:
+            names = "; ".join(lost[:5]) + ("..." if len(lost) > 5 else "")
+            warnings.append(
+                f"revision dropped {len(lost)} section heading(s) ({names}) and "
+                f"shrank to {ratio:.0%} of the previous size - verify no specified "
+                "content was lost (plan-v*.md snapshots are the record)")
+    if ratio < REVISE_SHRINK_REFUSE_RATIO:
+        return RevisionGate(
+            True,
+            detail=(f"the revision is {len(new):,} chars vs the plan's "
+                    f"{len(old):,} ({ratio:.0%})"),
+            warnings=warnings)
+    return RevisionGate(False, warnings=warnings)
+
+
 def parse_verdict(text: str) -> Verdict:
     """Interpret the reviewer reply. Unparseable output is NEVER treated as approval."""
     data = extract_json_object(text)
@@ -852,13 +955,13 @@ def snapshot(path: Path, dest_dir: Path, name: str) -> None:
 
 
 def drafter(prompt: str, cfg: Config, session: Optional[str], mode: str,
-            fork: bool = False) -> AgentResult:
+            fork: bool = False, timeout: Optional[int] = None) -> AgentResult:
     if cfg.dry_run:
         log(f"DRY-RUN claude (mode={mode}, resume={'yes' if session else 'no'}, "
             f"fork={'yes' if fork else 'no'}): {prompt[:120].replace(chr(10), ' ')}...")
         return AgentResult(ok=True, text="<dry-run revised plan>", session_id="dry-run")
     return call_claude(prompt, cwd=cfg.repo, cfg=cfg, session_id=session,
-                       permission_mode=mode, fork=fork)
+                       permission_mode=mode, fork=fork, timeout=timeout)
 
 
 def reviewer(prompt: str, cfg: Config, session: Optional[str]) -> AgentResult:
@@ -1049,8 +1152,10 @@ def log_usage_estimate(cfg: Config, implement: bool) -> None:
         f"zcode ~{n * 13_000:,} in / ~{n * 1_000:,} out (measured basis); "
         f"claude ~{n * 15_000:,} in / ~{n * 1_500:,} out (rough)")
     if cfg.fork_session_id:
-        log("note: --fork re-sends the forked conversation's FULL context on every "
-            "revise call - claude-side cost scales with that conversation's size")
+        log("note: revise calls fork this conversation (full context sent once, "
+            "then incremental resumes) - claude-side input scales with that "
+            "conversation's size; --no-fork instead re-sends plan+brief on "
+            "every revise call")
     if implement:
         log("note: --implement is the budget-dominating pass on 5h/weekly coding "
             "plans (agentic, multi-turn, edits files) and is NOT included in the "
@@ -1070,12 +1175,22 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
             if isinstance(v, (int, float)):
                 usage_by_agent[agent][k] = usage_by_agent[agent].get(k, 0) + v
 
-    settled: dict = {}   # authoritative human decisions: question -> answer
+    # Authoritative human decisions: question -> answer. CUMULATIVE across
+    # blocked-on-human rounds: earlier answers persist in the history dir and
+    # merge with this run's --decisions file (the file wins on the same
+    # question, so a changed answer overrides).
+    settled: dict = load_settled_state(cfg.history_dir) if not cfg.dry_run else {}
     if cfg.decisions_file:
-        settled = load_decisions_file(cfg.decisions_file)
-        if settled:
-            log(f"loaded {len(settled)} human decision(s) from {cfg.decisions_file}")
-            report.decisions = dict(settled)
+        settled.update(load_decisions_file(cfg.decisions_file))
+    if settled:
+        if not cfg.dry_run:
+            persist_settled_state(cfg.history_dir, settled)
+        if cfg.decisions_file:
+            log(f"loaded {len(settled)} human decision(s) "
+                f"(earlier rounds + {cfg.decisions_file})")
+        else:
+            log(f"loaded {len(settled)} human decision(s) from earlier rounds")
+        report.decisions = dict(settled)
 
     log_usage_estimate(cfg, implement)
 
@@ -1088,6 +1203,15 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         return EXIT_ERROR
     log(f"plan under review: {cfg.plan_path} ({len(plan_text)} chars); "
         f"agents' workspace: {cfg.repo}")
+    if not cfg.dry_run and len(plan_text) > REVISE_FEASIBILITY_WARN_CHARS:
+        w = (f"plan is {len(plan_text):,} chars: each revise round must re-emit "
+             f"the FULL document (~{len(plan_text) // 4:,} output tokens), which "
+             "is at or beyond what one model output turn reliably returns - "
+             "revisions are likely to truncate. The engine refuses shrunken "
+             "output rather than corrupting the file, but consider splitting "
+             "the plan into documents small enough to re-emit whole.")
+        report.warnings.append(w)
+        log(f"WARNING: {w}")
 
     # Continue snapshot numbering across resumed runs (rate-limit / open-question
     # exits) so plan-history stays a linear record of the whole consensus effort.
@@ -1200,29 +1324,81 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         # context, zero risk to the live session); the fork's returned session
         # then chains for later iterations under 'chained'. 'fresh' sessions get
         # plan + objections + brief inline each time.
+        # The drafter chains whenever a conversation was forked (inherit the
+        # full context once, then resume the fork incrementally) or when
+        # --strategy chained asked for it; the reviewer chains ONLY under
+        # --strategy chained, so each round's review stays independent by
+        # default.
+        drafter_chained = cfg.strategy == "chained" or bool(cfg.fork_session_id)
         fork_this = bool(cfg.fork_session_id and drafter_session is None
-                         and cfg.strategy == "chained")
-        use_session = drafter_session if cfg.strategy == "chained" else (
-            cfg.fork_session_id if fork_this else None)
-        revised = drafter(build_revise_prompt(plan_text, objections_json,
-                                              cfg.brief_text, settled), cfg,
-                          use_session, "plan", fork=fork_this)
+                         and drafter_chained)
+        use_session = drafter_session if drafter_chained else None
+        # Revising means re-emitting the whole document, so give the call room
+        # to actually finish: one --timeout's worth per REVISE_TIMEOUT_STEP_CHARS
+        # (capped). A 158KB plan at the 900s default was timing out mid-write.
+        revise_timeout = min(
+            cfg.timeout * REVISE_TIMEOUT_MAX_MULTIPLE,
+            int(cfg.timeout * max(1.0, len(plan_text) / REVISE_TIMEOUT_STEP_CHARS)))
+        if revise_timeout > cfg.timeout:
+            log(f"revise timeout scaled for document size: "
+                f"{cfg.timeout}s -> {revise_timeout}s")
+        revise_prompt = build_revise_prompt(plan_text, objections_json,
+                                            cfg.brief_text, settled)
+        revised = drafter(revise_prompt, cfg, use_session, "plan", fork=fork_this,
+                          timeout=revise_timeout)
         if not revised.ok or not revised.text.strip():
             record_failure(revised, "drafter revise failed", cfg, report)
             return EXIT_ERROR
         accumulate(revised.usage, "claude")
-        if cfg.strategy == "chained":
+        new_text = revised.text.strip()
+        # Truncation gate: an output turn that came back a fraction of the
+        # plan's size lost content, it did not revise the plan. Re-ask once
+        # with an explicit completeness instruction; if it shrinks again,
+        # stop with the file untouched rather than corrupting it.
+        gate = (check_revision_preserves_content(plan_text, new_text)
+                if not cfg.dry_run else RevisionGate(False))
+        if gate.refused:
+            log(f"revision REFUSED: {gate.detail} - truncated output turn, "
+                "re-asking with a completeness instruction")
+            revised = drafter(revise_prompt + TRUNCATION_RETRY_NOTE, cfg,
+                              use_session, "plan", fork=fork_this,
+                              timeout=revise_timeout)
+            if not revised.ok or not revised.text.strip():
+                record_failure(revised, "drafter revise retry failed", cfg, report)
+                return EXIT_ERROR
+            accumulate(revised.usage, "claude")
+            new_text = revised.text.strip()
+            gate = (check_revision_preserves_content(plan_text, new_text)
+                    if not cfg.dry_run else RevisionGate(False))
+            if gate.refused:
+                report.outcome = "revise-truncated"
+                report.error = (
+                    f"{gate.detail} even after one re-ask - almost certainly an "
+                    "output-length truncation, not a real revision. The plan "
+                    "file was NOT modified; the last good version stands "
+                    "(snapshots: plan-v*.md). Plans near or above ~100KB "
+                    "exceed what one output turn can re-emit: split the "
+                    "document, or make this round's revision in-chat and "
+                    "re-invoke.")
+                log(f"ERROR {report.error}")
+                return EXIT_ERROR
+        for w in gate.warnings:
+            report.warnings.append(w)
+            log(f"WARNING: {w}")
+        if drafter_chained:
             drafter_session = revised.session_id
             if fork_this and revised.session_id:
                 report.forked_from_session = cfg.fork_session_id
                 log(f"revise session forked from interactive conversation "
                     f"{cfg.fork_session_id[:8]}... -> {revised.session_id[:8]}...")
-        plan_text = revised.text.strip()
+        prev_len = len(plan_text)
+        plan_text = new_text
         if not cfg.dry_run:
             cfg.plan_path.write_text(plan_text + "\n", encoding="utf-8")
             vnum += 1
             snapshot(cfg.plan_path, cfg.history_dir, f"plan-v{vnum:02d}.md")
-        log(f"revised plan written ({len(plan_text)} chars) -> {cfg.plan_path}")
+        log(f"revised plan written ({len(plan_text)} chars, "
+            f"{len(plan_text) - prev_len:+d} vs previous) -> {cfg.plan_path}")
 
     # --- outcome -------------------------------------------------------------
     report.iterations_used = iterations_used
@@ -1328,6 +1504,35 @@ def load_decisions_file(path: str) -> dict:
             if str(v).strip():
                 out[str(k).strip()] = str(v).strip()
     return out
+
+
+def settled_state_path(history_dir: Path) -> Path:
+    return history_dir / "settled-decisions.json"
+
+
+def load_settled_state(history_dir: Path) -> dict:
+    """Decisions settled in earlier rounds of this same plan.
+
+    Each blocked-on-human exit writes only that round's FRESH questions to
+    open-questions.json, so a decisions.json rebuilt from it carries just the
+    newest delta. Without persisting answers here, the next run's reviewer
+    saw earlier decisions as open again, re-asked them, and the loop exited
+    at the question gate before any revise pass - the plan was never revised
+    with the decisions it had already collected."""
+    try:
+        data = json.loads(settled_state_path(history_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in data.items()
+            if str(k).strip() and str(v).strip()}
+
+
+def persist_settled_state(history_dir: Path, settled: dict) -> None:
+    history_dir.mkdir(parents=True, exist_ok=True)
+    settled_state_path(history_dir).write_text(
+        json.dumps(settled, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"]) -> list:
@@ -1572,11 +1777,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "constraints, in-chat decisions); embedded in every review "
                         "and revise prompt")
     p.add_argument("--fork-session-id", metavar="SID",
-                   help="fork this claude conversation for the revise calls (full "
-                        "context on every revise; costs scale with that conversation)")
+                   help="fork this claude conversation for the revise calls (implies "
+                        "drafter chaining). Defaults to auto-detecting the current "
+                        "interactive session; --no-fork disables forking entirely")
     p.add_argument("--fork-current-session", action="store_true",
                    help="same as --fork-session-id but auto-detects the current "
-                        "interactive session from ~/.claude/projects transcripts")
+                        "interactive session from ~/.claude/projects transcripts "
+                        "(this is already the default; kept for compatibility)")
+    p.add_argument("--no-fork", action="store_true",
+                   help="run revise calls as fresh sessions working from the context "
+                        "brief (the pre-0.5 default). By default the engine forks "
+                        "the current interactive conversation: full drafting "
+                        "context is inherited once, then the fork is resumed "
+                        "incrementally - cheaper than re-sending a reconstructed "
+                        "plan+brief every round")
+    p.add_argument("--fork-invocation-nonce", metavar="NONCE",
+                   help="unique string embedded in THIS engine command line by the "
+                        "invoking session: the engine forks the session whose "
+                        "transcript contains it - exact identification of the chat "
+                        "that triggered the run, no newest-transcript guesswork. "
+                        "Falls back to the newest transcript when the nonce "
+                        "matches nothing")
     p.add_argument("--expect-sha256", metavar="HASH",
                    help="sha256 of the plan file as the invoking session read it. "
                         "The engine refuses to start if the file on disk hashes "
@@ -1585,9 +1806,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
                    help=f"max review->revise cycles per invocation (default {DEFAULT_MAX_ITERATIONS})")
     p.add_argument("--strategy", choices=["fresh", "chained"], default="fresh",
-                   help="fresh: new session per call (default, avoids anchoring on rejected "
-                        "drafts); chained: reuse sessions via --resume (cheaper, risks drift). "
-                        "Required for --fork-session-id to take effect.")
+                   help="REVIEWER session policy: fresh (default - an independent "
+                        "review each round, no anchoring on its own prior verdicts) "
+                        "or chained (reuse the reviewer session via --resume; "
+                        "cheaper, risks anchoring). The drafter chains "
+                        "automatically whenever a conversation is forked.")
     p.add_argument("--implement", action="store_true",
                    help="after consensus, let claude implement the plan (acceptEdits). "
                         "Git push is never automated.")
@@ -1626,7 +1849,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--decisions", metavar="FILE",
                    help="file of human answers to open questions: the open-questions.json "
                         "this script writes on exit 4 with 'answer' fields filled in, "
-                        "or a plain {question: answer} JSON mapping")
+                        "or a plain {question: answer} JSON mapping. Answers are "
+                        "cumulative across rounds - settled answers persist in the "
+                        "history dir and merge with this file (same question in both: "
+                        "the file wins)")
     p.add_argument("--preflight", action="store_true",
                    help="verify both CLIs live (launcher, stdin delivery incl. a ~10KB "
                         "payload, JSON output shape) and exit without running the loop; "
@@ -1646,16 +1872,39 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"error: --implement-repo {r} is not a directory", file=sys.stderr)
             return EXIT_ERROR
 
+    if args.no_fork and (args.fork_session_id or args.fork_current_session
+                         or args.fork_invocation_nonce):
+        print("error: --no-fork cannot be combined with --fork-session-id, "
+              "--fork-current-session or --fork-invocation-nonce", file=sys.stderr)
+        return EXIT_ERROR
+    if args.fork_session_id and args.fork_current_session:
+        print("error: --fork-session-id and --fork-current-session are mutually exclusive",
+              file=sys.stderr)
+        return EXIT_ERROR
+    if args.fork_session_id and args.fork_invocation_nonce:
+        print("error: --fork-session-id and --fork-invocation-nonce are mutually "
+              "exclusive (both name the fork target)", file=sys.stderr)
+        return EXIT_ERROR
     fork_session_id = args.fork_session_id
-    if args.fork_current_session:
-        if fork_session_id:
-            print("error: --fork-session-id and --fork-current-session are mutually exclusive",
-                  file=sys.stderr)
-            return EXIT_ERROR
-        fork_session_id = discover_current_claude_session(Path.cwd())
+    if not fork_session_id and not args.no_fork:
+        # Forking the interactive conversation is the default (0.5.0): the
+        # revise calls inherit the drafting context that already exists
+        # instead of re-sending a reconstruction of it on every call. With a
+        # nonce the invoking chat is identified exactly; the mtime fallback
+        # is only for nonce-less invocations.
+        fork_session_id = discover_current_claude_session(Path.cwd(),
+                                                          args.fork_invocation_nonce)
+        if not fork_session_id and args.fork_invocation_nonce:
+            log("note: invocation nonce matched no session transcript - using "
+                "the newest transcript in this project directory instead")
+            fork_session_id = discover_current_claude_session(Path.cwd())
+        if fork_session_id and args.fork_invocation_nonce:
+            log(f"fork target = invoking session (nonce match): "
+                f"{fork_session_id[:8]}...")
         if not fork_session_id and not args.dry_run:
-            log("note: --fork-current-session found no current session transcript; "
-                "continuing without fork (pass --fork-session-id explicitly instead)")
+            log("note: no session transcript found to fork - revise "
+                "calls will run as fresh sessions with the context brief "
+                "(pass --fork-session-id <sid> to fork a specific conversation)")
 
     try:
         if args.link_repo and args.repo != ".":

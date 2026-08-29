@@ -6,6 +6,10 @@ Mode comes from CS_STUB_MODE env (inherited through the engine's subprocess):
              repos_touched), later calls approve.      [happy loop]
 - "openq"  : call 1 returns approve WITH an open question (engine must exit
              blocked-on-human), later calls approve.  [decisions resume]
+- "openq2" : calls 1 AND 2 return TWO open questions (simulates the reviewer
+             re-asking after answers were lost), call 3 demands a revise so
+             the settle->revise path bakes decisions into the plan, later
+             calls approve.            [cumulative decisions across rounds]
 - "approve": always approve.                          [implement paths]
 - "badjson": call 1 returns unparseable prose (engine must re-ask, NOT burn
              an iteration), later calls approve.  [parse retry]
@@ -39,6 +43,32 @@ counter = state_dir / f"{key}.count"
 n = (int(counter.read_text()) if counter.exists() else 0) + 1
 counter.write_text(str(n))
 
+if mode == "openq2" and n <= 2:
+    # Same two questions on both calls: if earlier answers were lost between
+    # runs, the engine treats them as fresh forever and never reaches a revise.
+    verdict = {
+        "verdict": "approve",
+        "objections": [],
+        "open_questions": [
+            {"question": "Q1: ship the stub feature free or Pro-only?",
+             "why": "pricing decision", "options": ["free", "pro-only"],
+             "recommendation": "free"},
+            {"question": "Q2: include dark mode at launch?",
+             "why": "scope decision", "options": ["yes", "no"],
+             "recommendation": "no"},
+        ],
+        "fyi_notes": [],
+        "repos_touched": ["repoa"],
+        "strengths": ["stub strength: rollback path is concrete"],
+        "summary": "stub needs two human decisions",
+    }
+    print(json.dumps({
+        "response": json.dumps(verdict),
+        "sessionId": f"stub-zcode-{n}",
+        "usage": {"input_tokens": 1000, "output_tokens": 50},
+    }))
+    sys.exit(0)
+
 if mode == "badjson" and n == 1:
     # Unparseable reviewer output: prose, no JSON anywhere.
     print(json.dumps({
@@ -63,6 +93,18 @@ if mode == "approveminors" and n == 1:
         "repos_touched": ["repoa"],
         "strengths": ["stub strength: rollback path is concrete"],
         "summary": "stub approves but wants one more polish round",
+    }
+elif mode == "openq2" and n == 3:
+    verdict = {
+        "verdict": "revise",
+        "objections": [{"severity": "blocking",
+                        "point": "stub blocking: bake the settled human "
+                                 "decisions into the plan"}],
+        "open_questions": [],
+        "fyi_notes": [],
+        "repos_touched": ["repoa"],
+        "strengths": [],
+        "summary": "stub wants decisions incorporated",
     }
 elif mode == "approve" or (n >= 2):
     verdict = {

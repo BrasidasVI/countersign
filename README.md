@@ -90,11 +90,6 @@ Optional flags:
 - `--implement` — after consensus, claude implements the plan (acceptEdits)
   in the repos the agents identified. Refuses to touch a repo on
   main/master; changes stay uncommitted.
-- `--fork` — the revise calls fork THIS conversation for full context
-  instead of working from the context brief. More capable, but it re-sends
-  the whole conversation on every revise call — costly on 5h/weekly plan
-  windows and rarely worth it for long chats. Default is a short
-  context-brief file the session writes before the loop.
 - `--iterations N` — raise the per-invocation review cap (default 4).
 - `--repos A,B` — review against exactly these repos for this run. When the
   plan lives in one of them and the project isn't known yet, the set is
@@ -105,7 +100,13 @@ Optional flags:
 
 1. The session writes a **context brief** (intent, constraints, decisions
    already made in-chat, out of scope) next to the plan — this is how the
-   headless agents inherit your conversation cheaply.
+   reviewer inherits your conversation's intent. The revising claude gets
+   the fuller picture by forking the conversation that invoked the run —
+   automatic and derived, not a flag: the engine command embeds a nonce that
+   identifies exactly which chat triggered it, so re-triggering from the
+   same chat reuses its context, and starting a new chat is the one way to
+   reset it. (Stale context can therefore only come from staying in an old
+   chat — a user decision, by design.)
 2. The engine builds a **synthetic workspace** (`~/.countersign/ws/<hash>/`)
    containing links to exactly the repos resolved for this plan's project —
    by default the one repo the plan lives in. The agents see those and
@@ -120,6 +121,8 @@ Optional flags:
 4. **Product/direction questions stop the loop** and appear in your chat
    with options and the reviewer's recommendation. Answer in plain text;
    the session records your decisions and resumes the loop automatically.
+   Decisions are cumulative across rounds — earlier answers persist in the
+   plan's history dir, so a later round's answers never erase them.
 5. On consensus you get the final plan plus a summary of what changed and
    why, straight from the session that knows the intent.
 
@@ -202,3 +205,9 @@ workspaces under `~/.countersign/ws/` are reused as-is by the plugin.
 - Git commit and push are never automated.
 - API keys are never written to logs, stdout, or files.
 - Unparseable reviewer output is treated as a blocking objection, never approval.
+- A revision that comes back a fraction of the plan's size is treated as a
+  truncated output turn, not a revision: the engine re-asks once, then stops
+  with `revise-truncated` leaving the plan untouched at its last good state.
+  (Each revise round re-emits the FULL document, so plans near/above ~100KB
+  outgrow a single output turn — split them; the engine also warns up-front
+  and scales the revise timeout with document size.)

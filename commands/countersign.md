@@ -1,6 +1,6 @@
 ---
 description: Dual-agent consensus on a planning doc - GLM reviews, headless Claude revises, loop until consensus
-argument-hint: <plan-file.md> [--implement] [--fork] [--iterations N] [--repos A,B]
+argument-hint: <plan-file.md> [--implement] [--iterations N] [--repos A,B]
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
@@ -14,9 +14,9 @@ after: mediate results and human decisions back into this chat.
 
 Arguments: `$ARGUMENTS`
 Parse them: one plan file path (required), plus optional flags
-`--implement`, `--fork`, `--iterations N`, `--repos <p1>,<p2>,...`. If no plan
-path is given, ask the user which planning document to review before doing
-anything else.
+`--implement`, `--iterations N`, `--repos <p1>,<p2>,...`. If no plan path is
+given, ask the user which planning document to review before doing anything
+else.
 
 ## Step 1 - locate and verify the plan
 
@@ -103,13 +103,14 @@ so in the brief.
 Build and run with Bash (adjust flags from the parsed arguments):
 
 ```bash
+NONCE="cs-$(date +%s)-$RANDOM$RANDOM"
 python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
   --expect-sha256 "<hash you captured when reading the plan>" \
+  --fork-invocation-nonce "$NONCE" \
   $(printf -- '--link-repo %q ' "${REPOS[@]}") \
   --context-brief "<plan-dir>/.countersign/<plan-stem>-context-brief.md" \
   [--decisions "<decisions file>" (only when resuming after answers)] \
   [--implement] \
-  [--strategy chained --fork-current-session (only when --fork given)] \
   [--max-iterations N (only when --iterations given)]
 ```
 
@@ -120,8 +121,16 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
 - Do not filter or pipe the engine's output; it ends with ONE JSON line on
   stdout that you must parse. Expect the run to take minutes; the engine
   streams progress to stderr with a heartbeat.
-- `--fork` costs more on every revise call (it re-sends this whole
-  conversation's context) - only use it when the user asked for it.
+- The engine forks THIS conversation for the revise calls - automatically,
+  no flags, no decision to make. The nonce in the command above identifies
+  this exact chat (the command line carrying it is recorded in this chat's
+  transcript before the engine runs), so the fork target is derived, never
+  guessed. Re-triggering /countersign from this same chat re-forks the same
+  conversation; starting a NEW chat is the one and only way the context
+  resets. If a run ever seems anchored to stale context, the fix is a new
+  chat - by design, that is the only usage error left to make. The context
+  brief from Step 4 is still required: the reviewer (zcode) never sees the
+  forked conversation, only the brief.
 
 ## Step 6 - mediate the outcome
 
@@ -144,7 +153,14 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   question IN THIS CHAT, showing options and the reviewer's recommendation.
   After the user answers, fill the `answer` fields into that JSON, save it
   as `<history_dir>/decisions.json`, and re-run the engine exactly as before
-  plus `--decisions "<history_dir>/decisions.json"`. Loop back to this step.
+  plus `--decisions "<history_dir>/decisions.json"`. Decisions are
+  CUMULATIVE across rounds: if a decisions.json from an earlier round
+  exists, keep its answered entries (this file may carry only the newest
+  delta - the engine also persists settled answers in
+  `<history_dir>/settled-decisions.json` and merges, the file's answer
+  winning on the same question). To change a settled answer, pass the new
+  answer via decisions.json; to drop one entirely, also remove it from
+  settled-decisions.json. Loop back to this step.
 - **blocked-on-branch** - Report which repos sit on main/master (nothing was
   edited). Offer to create feature branches; if the user agrees, create
   them, then re-run the engine unchanged. Loop back to this step.
@@ -152,6 +168,14 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   run's state is persisted (plan snapshots + reviews in `history_dir`), so
   re-running later continues rather than re-spending earlier iterations.
   Stop; do not retry automatically.
+- **revise-truncated** - The drafting agent's revision came back a small
+  fraction of the plan's size even after one re-ask: a truncated output
+  turn, not a real revision. The plan file was NOT modified - the last good
+  version stands. Tell the user, surface any `warnings` from the report,
+  and offer the real options: split the plan into smaller documents (each
+  revise round re-emits the FULL document, and plans near/above ~100KB
+  exceed one output turn), or make this round's revision together in-chat
+  and re-invoke on the updated file.
 - **locked** - Another countersign run is already working on this same plan
   (check for a background task in this or another session). Tell the user;
   do not delete the lock unless they confirm the other run is dead.
@@ -167,4 +191,5 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   stderr output; suggest the likely fix.
 
 When re-running the engine (any branch above), always reuse the same plan
-path and flags, adding only what that branch requires.
+path and flags, adding only what that branch requires; generate a fresh
+NONCE each time (any new value identifies this same chat identically).
