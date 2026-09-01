@@ -30,6 +30,10 @@ Output contract (stable, machine-read by the plugin command):
   - a revise reply that is a fraction of the plan's size is treated as a
     truncated output turn: one re-ask, then outcome "revise-truncated" with
     the plan file left untouched at its last good state.
+  - SIGTERM/SIGHUP unwind cleanly (outcome "interrupted"): lock released,
+    plan left at its last fully-written version (plan writes are atomic).
+    SIGKILL strands the lock, and the next run automatically takes over a
+    lock whose recorded holder PID is dead.
 
 Human-in-the-loop surfaces (all mediated by the interactive session):
   - Open questions (product/company decisions): the loop STOPS, exit 4,
@@ -62,6 +66,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -954,6 +959,18 @@ def snapshot(path: Path, dest_dir: Path, name: str) -> None:
     (dest_dir / name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def write_atomic(path: Path, text: str) -> None:
+    # Temp file + rename in the same directory: a kill mid-write can only
+    # leave the OLD contents or the NEW ones on disk, never a truncated mix.
+    # os.replace is atomic on POSIX and Windows within one filesystem.
+    tmp = path.with_name(path.name + ".cs-tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def drafter(prompt: str, cfg: Config, session: Optional[str], mode: str,
             fork: bool = False, timeout: Optional[int] = None) -> AgentResult:
     if cfg.dry_run:
@@ -1115,21 +1132,65 @@ def check_plan_repo_consistency(plan_path: Path, link_repos: list) -> list:
     return warnings
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when a process with this pid exists. Conservative on doubt: a pid
+    we cannot probe counts as alive, because taking over a LIVE lock risks
+    interleaved in-place revisions - the exact corruption the lock prevents.
+    (os.kill(pid, 0) sends no signal on POSIX; on Windows it TERMINATES the
+    target, so probe via OpenProcess there.)"""
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                k32.CloseHandle(handle)
+                return True
+            # ERROR_ACCESS_DENIED (5): the process exists but is not ours to query
+            return ctypes.get_last_error() == 5
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _lock_holder_pid(lock: Path) -> Optional[int]:
+    """PID recorded in an existing lock file, None when absent/unreadable."""
+    try:
+        m = re.search(r"^pid=(\d+)\b", lock.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return None
+    return int(m.group(1)) if m else None
+
+
 def acquire_plan_lock(history_dir: Path) -> Optional[Path]:
     """One engine run per plan at a time: the plan is revised IN PLACE and the
     history dir is shared, so two concurrent loops on the same plan would
     interleave revisions and clobber each other's iteration records. Returns
-    the lock path on success, None when another run holds it. Locks older than
-    12h are treated as stale (crashed run) and taken over."""
+    the lock path on success, None when another run holds it. A lock whose
+    recorded holder PID is dead is taken over immediately - that is the debris
+    of a killed run (an invoking session's tool timeout, a crash), which
+    releases nothing on its way out. Anything the PID probe cannot settle
+    (unreadable lock, denied, recycled pid) falls back to the 12h age rule."""
     lock = history_dir / "run.lock"
     history_dir.mkdir(parents=True, exist_ok=True)
     try:
         if lock.exists():
-            age = time.time() - lock.stat().st_mtime
-            if age < 12 * 3600:
-                return None
-            log(f"plan lock is {int(age // 3600)}h old - taking over (stale run?)")
-            lock.unlink()
+            holder = _lock_holder_pid(lock)
+            if holder is not None and not _pid_alive(holder):
+                log(f"plan lock holder pid {holder} is dead - taking over "
+                    "(run was killed?)")
+                lock.unlink()
+            else:
+                age = time.time() - lock.stat().st_mtime
+                if age < 12 * 3600:
+                    return None
+                log(f"plan lock is {int(age // 3600)}h old - taking over (stale run?)")
+                lock.unlink()
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(f"pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}")
@@ -1394,7 +1455,7 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         prev_len = len(plan_text)
         plan_text = new_text
         if not cfg.dry_run:
-            cfg.plan_path.write_text(plan_text + "\n", encoding="utf-8")
+            write_atomic(cfg.plan_path, plan_text + "\n")
             vnum += 1
             snapshot(cfg.plan_path, cfg.history_dir, f"plan-v{vnum:02d}.md")
         log(f"revised plan written ({len(plan_text)} chars, "
@@ -1755,7 +1816,19 @@ def preflight(cfg: Config, report: RunReport) -> int:
 # CLI
 # --------------------------------------------------------------------------
 
+def _signal_to_interrupt(signum, _frame):
+    # SIGTERM/SIGHUP become KeyboardInterrupt so the run unwinds through the
+    # normal exit paths: lock released, one JSON report line printed, state
+    # persisted. The default disposition kills the process instantly and
+    # strands the lock; SIGKILL still does (nothing can catch it), which is
+    # what the dead-PID takeover in acquire_plan_lock is for.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _signal_to_interrupt)
     p = argparse.ArgumentParser(
         description="countersign consensus engine: review an existing plan with ZCode (GLM), "
                     "revise it with headless claude, loop until consensus. "
@@ -2005,10 +2078,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             if plan_lock is None:
                 report.outcome = "locked"
                 report.error = (
-                    f"another countersign run is already working on {cfg.plan_path} "
-                    f"(lock: {cfg.history_dir / 'run.lock'}). Concurrent loops on the "
-                    "same plan would corrupt each other's revisions - wait for it to "
-                    "finish, or delete the lock file if that run crashed.")
+                    f"another countersign run holds the lock on {cfg.plan_path} "
+                    "and its process is alive (locks left behind by dead runs "
+                    "are taken over automatically, so reaching this means a run "
+                    "is genuinely active). Concurrent loops on the same plan "
+                    "would corrupt each other's revisions - wait for it to "
+                    "finish, or delete the lock if the user confirms that run "
+                    "is dead.")
                 log(f"ERROR {report.error}")
                 return EXIT_ERROR
             try:
@@ -2018,6 +2094,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     Path(plan_lock).unlink(missing_ok=True)
         except KeyboardInterrupt:
             report.outcome = "interrupted"
+            report.error = ("run was interrupted (signal/kill) before finishing; "
+                            "the plan file holds its last fully-written version "
+                            "and the lock was released - re-run the same command "
+                            "to continue from persisted state")
             raise
         finally:
             # stdout carries exactly one machine-readable line on every exit path.

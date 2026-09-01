@@ -119,9 +119,18 @@ PYTHON="$(command -v python3 || command -v python)"
 - If the plan's repo root (walk up from the plan file to the containing git
   repository) has an `agent-review-rules.md`, also pass
   `--review-rules "<that file>"`.
+- LAUNCH THIS AS A BACKGROUND TASK, never a plain foreground Bash call: a
+  full loop (several headless review+revise rounds, each revise re-emitting
+  the ENTIRE plan) routinely runs longer than a tool's default foreground
+  timeout, and a killed run both wastes the in-flight iteration and can
+  strand the plan mid-write. Use the Bash tool's run_in_background mode (or,
+  where that is unavailable, `nohup <command> >> "<plan-dir>/.countersign/run.log" 2>&1 &`
+  and poll the log). The engine is built for this: stderr carries a progress
+  heartbeat while it runs, and stdout still ends with exactly ONE JSON line.
 - Do not filter or pipe the engine's output; it ends with ONE JSON line on
-  stdout that you must parse. Expect the run to take minutes; the engine
-  streams progress to stderr with a heartbeat.
+  stdout that you must parse (in background mode: the last line of the
+  captured output file). Expect the run to take minutes - hence the
+  background launch.
 - The engine forks THIS conversation for the revise calls - automatically,
   no flags, no decision to make. The nonce in the command above identifies
   this exact chat (the command line carrying it is recorded in this chat's
@@ -177,9 +186,11 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   revise round re-emits the FULL document, and plans near/above ~100KB
   exceed one output turn), or make this round's revision together in-chat
   and re-invoke on the updated file.
-- **locked** - Another countersign run is already working on this same plan
-  (check for a background task in this or another session). Tell the user;
-  do not delete the lock unless they confirm the other run is dead.
+- **locked** - Another countersign run holds this plan's lock AND its
+  process is alive - the engine automatically takes over locks left by dead
+  runs, so reaching this outcome means a run is genuinely active. Check for
+  a background task in this or another session. Tell the user; do not
+  delete the lock unless they confirm the other run is dead.
 - **plan-mismatch** - The plan on disk is NOT the version you read (wrong
   branch/worktree or it changed under you). Do NOT proceed. Re-locate the
   correct file, read it fresh, capture the new hash, tell the user what
@@ -190,6 +201,10 @@ verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
   the plan together in-chat first, or accept the disagreement and stop.
 - **error** - Show `error` from the report and the tail of the engine's
   stderr output; suggest the likely fix.
+- **interrupted** - The engine was killed/signalled mid-run (host session
+  ended, machine slept). The lock was released and the plan file holds its
+  last fully-written version - nothing was corrupted. Re-run the engine
+  exactly as before to continue from the persisted state.
 
 When re-running the engine (any branch above), always reuse the same plan
 path and flags, adding only what that branch requires; generate a fresh

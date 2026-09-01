@@ -7,6 +7,12 @@ Scenarios (sequential, each with its own plan file and fake repos):
   C. branch block      : approve + --implement, repo on main => exit 5, no edits
   D. implement         : same but repo on feature branch => exit 0, file lands
                          in the REAL repo through the junction workspace
+  F. plan lock         : a lock whose holder PID is dead (killed run) is
+                         taken over automatically; a LIVE holder still
+                         refuses (exit 2, outcome locked)
+  P. SIGTERM unwind    : engine signalled mid-review-call => exit 2 with
+                         outcome "interrupted", lock released, one JSON
+                         line still on stdout (POSIX only)
   I. approve-with-minors: approve + minor suggestion => NOT consensus yet, one
                          more revise round, then consensus; the suggestion
                          reaches the drafter and the review artifact
@@ -37,6 +43,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -195,18 +202,61 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("raw persisted untruncated (>4000 chars)",
           len(rj["raw"]) > 4000, str(len(rj["raw"])))
 
-    print("scenario F: second concurrent run on the same plan is refused")
+    print("scenario F: plan lock - dead holder taken over, live holder refused")
     planF = make_plan(repoA, "plan-f.md", "# Plan F\n\nGoal: stub goal.\n")
     histF = planA.parent / ".countersign" / "plan-f-history"
     histF.mkdir(parents=True, exist_ok=True)
-    (histF / "run.lock").write_text("pid=99999 started=fake\n", encoding="utf-8")
+    dead = subprocess.Popen([PY, "-c", "pass"])
+    dead.wait()   # a pid guaranteed not to exist: the debris of a killed run
+    (histF / "run.lock").write_text(
+        f"pid={dead.pid} started=2020-01-01T00:00:00+00:00\n", encoding="utf-8")
     rc, rep, err = run_engine(planF, [repoA, repoB], stub_mode="approve")
-    check("exit code 2", rc == 2, f"rc={rc}")
-    check("outcome locked", rep and rep.get("outcome") == "locked", str(rep)[:120])
-    (histF / "run.lock").unlink()
-    rc, rep, err = run_engine(planF, [repoA, repoB], stub_mode="approve")
-    check("runs again once lock cleared", rc == 0 and rep.get("outcome") == "consensus")
+    check("dead-PID lock taken over",
+          rc == 0 and rep and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("takeover logged", "is dead" in err, err[-160:])
     check("lock released after run", not (histF / "run.lock").exists())
+    (histF / "run.lock").write_text(          # live holder: this test process
+        f"pid={os.getpid()} started=2020-01-01T00:00:00+00:00\n", encoding="utf-8")
+    rc, rep, err = run_engine(planF, [repoA, repoB], stub_mode="approve")
+    check("live-PID lock refused",
+          rc == 2 and rep and rep.get("outcome") == "locked", f"rc={rc}")
+    (histF / "run.lock").unlink()
+
+    if os.name != "nt":
+        # Windows terminate() is a hard kill (no signal delivery), so the
+        # SIGTERM-unwind behavior is only provable on POSIX.
+        print("scenario P: SIGTERM mid-review unwinds cleanly")
+        planP = make_plan(repoA, "plan-p.md", "# Plan P\n\nGoal: stub goal.\n")
+        histP = planA.parent / ".countersign" / "plan-p-history"
+        envP = dict(os.environ, CS_STUB_MODE="hang",
+                    CS_STUB_STATE_DIR=str(STATE_DIR))
+        cmdP = [PY, str(ENGINE), str(planP),
+                "--claude-cli", str(STUB_CLAUDE), "--zcode-cli", str(STUB_ZCODE),
+                "--heartbeat", "0", "--max-retries", "0", "--no-fork",
+                "--link-repo", str(repoA), "--link-repo", str(repoB)]
+        proc = subprocess.Popen(cmdP, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=envP)
+        lockP = histP / "run.lock"
+        for _ in range(150):                    # wait until the lock is held
+            if lockP.exists() or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        check("lock observed held mid-run", lockP.exists())
+        proc.terminate()                        # SIGTERM the engine
+        outP, _ = proc.communicate(timeout=30)
+        check("exit code 2 after SIGTERM",
+              proc.returncode == 2, f"rc={proc.returncode}")
+        rep = None
+        for line in reversed(outP.strip().splitlines()):
+            try:
+                rep = json.loads(line)
+                break
+            except ValueError:
+                continue
+        check("outcome interrupted",
+              rep and rep.get("outcome") == "interrupted", str(rep)[:120])
+        check("lock released by unwind", not lockP.exists())
 
     print("scenario G: stale/wrong-branch plan refused via --expect-sha256")
     planG = make_plan(repoA, "plan-g.md", "# Plan G\n\nGoal: stub goal.\n")

@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -42,6 +43,11 @@ key = hashlib.md5((attach or "none").encode()).hexdigest()[:12]
 counter = state_dir / f"{key}.count"
 n = (int(counter.read_text()) if counter.exists() else 0) + 1
 counter.write_text(str(n))
+
+if mode == "hang":
+    # Reviewer never answers: lets the e2e suite SIGTERM the engine mid-call
+    # and assert the unwind (lock released, interrupted report on stdout).
+    time.sleep(600)
 
 if mode == "openq2" and n <= 2:
     # Same two questions on both calls: if earlier answers were lost between

@@ -205,6 +205,11 @@ workspaces under `~/.countersign/ws/` are reused as-is by the plugin.
 - Git commit and push are never automated.
 - API keys are never written to logs, stdout, or files.
 - Unparseable reviewer output is treated as a blocking objection, never approval.
+- Plan revisions are written atomically (temp file + rename): a run killed
+  mid-write leaves the previous version or the new one, never a truncated mix.
+- A run killed by SIGTERM/SIGHUP unwinds cleanly (`interrupted`, lock
+  released); after SIGKILL, the next run automatically takes over the lock
+  when its recorded holder PID is dead - no manual lock cleanup.
 - A revision that comes back a fraction of the plan's size is treated as a
   truncated output turn, not a revision: the engine re-asks once, then stops
   with `revise-truncated` leaving the plan untouched at its last good state.
