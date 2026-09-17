@@ -56,6 +56,11 @@ Usage limits (Claude Pro / z.ai 5h+weekly windows):
     newest transcript; full context inherited once, then the fork is resumed
     incrementally) instead of re-sending a reconstructed plan+brief on every
     call; --no-fork restores fresh revise sessions.
+  - the reviewer CHAINS by default (--strategy chained): every round resumes
+    its own prior session, within a run and across re-runs (decisions /
+    rate-limit / interrupted resumes), so earlier rounds' context is kept and
+    paid for once instead of re-derived per round; --strategy fresh restores
+    fully independent reviews.
 """
 
 from __future__ import annotations
@@ -1280,6 +1285,21 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
                       if (m := re.match(r"plan-v(\d+)\.md$", p.name)))
     vnum = (existing[-1] if existing else 0)
 
+    # Chained reviewer: resume the reviewer's own session across invocations
+    # too (blocked-on-human / rate-limit / interrupted re-runs), so prior
+    # rounds' context is kept instead of re-reviewing from scratch and
+    # re-spending those tokens.
+    if cfg.strategy == "chained" and not cfg.dry_run:
+        for p in sorted(cfg.history_dir.glob("review-iter-*.json"), reverse=True):
+            try:
+                sid = json.loads(p.read_text(encoding="utf-8")).get("sessionId")
+            except (OSError, ValueError):
+                continue
+            if sid:
+                reviewer_session = sid
+                log(f"reviewer chaining: resuming session recorded in {p.name}")
+                break
+
     consensus = False
     verdict: Optional[Verdict] = None
     iterations_used = 0
@@ -1386,10 +1406,9 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         # then chains for later iterations under 'chained'. 'fresh' sessions get
         # plan + objections + brief inline each time.
         # The drafter chains whenever a conversation was forked (inherit the
-        # full context once, then resume the fork incrementally) or when
-        # --strategy chained asked for it; the reviewer chains ONLY under
-        # --strategy chained, so each round's review stays independent by
-        # default.
+        # full context once, then resume the fork incrementally) - the default,
+        # since forks are derived automatically - and the reviewer chains by
+        # default too; --strategy fresh makes each round fully independent.
         drafter_chained = cfg.strategy == "chained" or bool(cfg.fork_session_id)
         fork_this = bool(cfg.fork_session_id and drafter_session is None
                          and drafter_chained)
@@ -1878,11 +1897,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "version (e.g. a worktree that branched from the wrong base)")
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
                    help=f"max review->revise cycles per invocation (default {DEFAULT_MAX_ITERATIONS})")
-    p.add_argument("--strategy", choices=["fresh", "chained"], default="fresh",
-                   help="REVIEWER session policy: fresh (default - an independent "
-                        "review each round, no anchoring on its own prior verdicts) "
-                        "or chained (reuse the reviewer session via --resume; "
-                        "cheaper, risks anchoring). The drafter chains "
+    p.add_argument("--strategy", choices=["fresh", "chained"], default="chained",
+                   help="REVIEWER session policy: chained (default - the reviewer "
+                        "resumes its own session each round, within a run and "
+                        "across re-runs: cheaper on usage limits, and it can "
+                        "verify its earlier objections were resolved; anchoring "
+                        "on its own prior verdicts is the accepted trade) or "
+                        "fresh (an independent review each round, re-deriving "
+                        "all context every time). The drafter chains "
                         "automatically whenever a conversation is forked.")
     p.add_argument("--implement", action="store_true",
                    help="after consensus, let claude implement the plan (acceptEdits). "

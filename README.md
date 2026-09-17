@@ -95,6 +95,12 @@ Optional flags:
   plan lives in one of them and the project isn't known yet, the set is
   remembered for that project (see below); on a known project it acts as a
   one-off override and nothing is rewritten.
+- `--strategy fresh|chained` — reviewer session policy (default `chained`).
+  Chained: the reviewer resumes its own session every round — within a run
+  and across re-runs — keeping prior rounds' context, which cuts per-round
+  zcode token spend and lets it verify its earlier objections were resolved.
+  `fresh` re-reviews independently each round (no anchoring on its own prior
+  verdicts, at the cost of re-deriving everything every iteration).
 
 ### What happens when you invoke it
 
@@ -128,6 +134,10 @@ Optional flags:
 
 ### Usage limits (Claude Pro / z.ai 5h + weekly windows)
 
+- The chained reviewer (default, `--strategy chained`) is the main lever on
+  zcode spend: each round resumes the reviewer's own session instead of
+  re-reading and re-deriving the plan from scratch, including on re-runs
+  after decisions or rate limits.
 - A pre-run cost estimate is logged before the loop starts; per-agent token
   totals are reported in the final summary.
 - Rate/quota hits back off exponentially; a spent window exits

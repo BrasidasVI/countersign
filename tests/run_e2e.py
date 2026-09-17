@@ -37,6 +37,7 @@ Scenarios (sequential, each with its own plan file and fake repos):
                          different (newer-mtime) transcript exists in the
                          same project directory
 """
+import hashlib
 import json
 import os
 import re
@@ -117,6 +118,13 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
 
     repoA = T / "repoa"          # starts on main (branch-block scenario), switched later
     repoB = T / "repob"
+
+    def stub_resumes(plan):
+        """Resume sessionIds the stub zcode recorded for this plan's attach key."""
+        key = hashlib.md5(str(plan).encode()).hexdigest()[:12]
+        f = STATE_DIR / "cs-stub-state" / f"{key}.resumes"
+        return f.read_text(encoding="utf-8").split() if f.exists() else []
+
     make_repo(repoA, "main")
     make_repo(repoB, "dev")
 
@@ -145,6 +153,8 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("usage accumulated",
           rep.get("usage", {}).get("zcode", {}).get("input_tokens") == 2000,
           json.dumps(rep.get("usage", {})))
+    check("reviewer chains within a run (round 2 resumed round 1's session)",
+          stub_resumes(planA) == ["stub-zcode-1"], str(stub_resumes(planA)))
 
     print("scenario B: blocked-on-human then decisions resume")
     planB = make_plan(repoA, "plan-b.md", "# Plan B\n\nGoal: stub goal.\n")
@@ -157,12 +167,16 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     qs[0]["answer"] = "flag on"
     dec = oqf.parent / "decisions.json"
     dec.write_text(json.dumps(qs, indent=2), encoding="utf-8")
-    rc2, rep2, _ = run_engine(planB, [repoA, repoB], extra=["--decisions", str(dec)],
-                              stub_mode="openq")
+    rc2, rep2, err2 = run_engine(planB, [repoA, repoB], extra=["--decisions", str(dec)],
+                                 stub_mode="openq")
     check("resume exit 0", rc2 == 0, f"rc={rc2}")
     check("resume consensus", rep2 and rep2.get("outcome") == "consensus")
     check("decision recorded", rep2.get("decisions", {}).get(
         "Ship the stub feature behind a flag?") == "flag on")
+    check("reviewer session resumed across invocations (seeded from review-iter)",
+          "reviewer chaining: resuming session" in err2, err2[-200:])
+    check("resumed call carried the recorded sessionId",
+          stub_resumes(planB) == ["stub-zcode-1"], str(stub_resumes(planB)))
 
     print("scenario C: implement blocked on main")
     planC = make_plan(repoA, "plan-c.md", "# Plan C\n\nGoal: stub goal.\n")

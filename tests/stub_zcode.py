@@ -32,9 +32,12 @@ from pathlib import Path
 
 args = sys.argv[1:]
 attach = None
+resume = None
 for i, a in enumerate(args):
     if a == "--attach" and i + 1 < len(args):
         attach = args[i + 1]
+    if a == "--resume" and i + 1 < len(args):
+        resume = args[i + 1]
 
 mode = os.environ.get("CS_STUB_MODE", "revise")
 state_dir = Path(os.environ.get("CS_STUB_STATE_DIR", tempfile.gettempdir())) / "cs-stub-state"
@@ -43,6 +46,10 @@ key = hashlib.md5((attach or "none").encode()).hexdigest()[:12]
 counter = state_dir / f"{key}.count"
 n = (int(counter.read_text()) if counter.exists() else 0) + 1
 counter.write_text(str(n))
+if resume:
+    # recorded so the e2e suite can assert the reviewer actually chains
+    with open(state_dir / f"{key}.resumes", "a", encoding="utf-8") as f:
+        f.write(resume + "\n")
 
 if mode == "hang":
     # Reviewer never answers: lets the e2e suite SIGTERM the engine mid-call
