@@ -1,10 +1,17 @@
 ---
-description: Dual-agent consensus on a planning doc - GLM reviews, headless Claude revises, loop until consensus
-argument-hint: <plan-file.md> [--implement] [--iterations N] [--repos A,B]
+description: Plan mode - dual-agent consensus on a planning doc (GLM reviews, headless Claude revises, loop until consensus). For implementing a discussed change, use the countersign skill instead.
+argument-hint: <plan-file.md> [--implement] [--iterations N]
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
-# /countersign - dual-agent consensus loop
+# /countersign - plan-consensus mode (design review)
+
+This is the DESIGN-REVIEW entry point: run it on a plan document the human
+wants stress-tested BEFORE implementation - architecture changes, data
+model or API contract changes, security boundaries, migrations. It is the
+explicit opt-in gate, not the default path: when the human asks to
+IMPLEMENT something discussed in chat, use the countersign skill instead
+(intent doc -> consensus -> implement -> verify -> commit).
 
 You (the interactive session) are the DRAFTER OF RECORD: you hold this
 conversation's context. The engine below runs the loop headlessly - ZCode
@@ -14,9 +21,8 @@ after: mediate results and human decisions back into this chat.
 
 Arguments: `$ARGUMENTS`
 Parse them: one plan file path (required), plus optional flags
-`--implement`, `--iterations N`, `--repos <p1>,<p2>,...`. If no plan path is
-given, ask the user which planning document to review before doing anything
-else.
+`--implement`, `--iterations N`. If no plan path is given, ask the user
+which planning document to review before doing anything else.
 
 ## Step 1 - locate and verify the plan
 
@@ -31,65 +37,25 @@ else.
   out to be a different version than the one you read (wrong-branch
   worktree, base-commit mixup, mid-session edit).
 - Before launching, tell the user which branch and commit of the plan's
-  repo you are about to review (the engine logs it too). If a worktree is
-  active, verify it is based on the user's actual branch — a worktree
-  silently based on `origin/main` while the user works on `dev` reviews a
-  stale plan.
+  repo you are about to review (the engine logs it too).
 
 ## Step 2 - device setup (once per device)
 
 - Check for `~/.countersign/preflight-ok`. If missing, run the engine once
-  with `--preflight` first (see command shape below, replacing the plan file
-  with `--preflight x`). On success, write the marker file. On failure, show
-  the user the failures and stop - do not run the loop.
-- Nothing else is device-global. Repo sets are PER PROJECT (Step 3): never
-  write or consult a device-wide repo list - applying one project's repos to
-  another project's plan links the wrong code.
+  with `--preflight` first (replacing the plan file with `--preflight x`).
+  On success, write the marker file. On failure, show the user the failures
+  and stop - do not run the loop.
 
-## Step 3 - resolve the repo set for THIS plan
-
-- Find the plan's repo root:
-  `git -C "<plan dir>" rev-parse --show-toplevel` (empty output means the
-  plan is not inside a git repository).
-- If the user passed `--repos <p1>,<p2>,...`: expand `~`, resolve each to an
-  absolute path, and use exactly those for this run. Additionally, if the
-  plan's repo root IS among them AND no existing project entry (see below)
-  already contains the plan's repo root, remember the set: read
-  `~/.countersign/config.json` (create `{}` if missing), ensure a `projects`
-  object, store `{"repos": ["<abs path>", ...]}` under a key named after the
-  plan repo root's directory (e.g. `ladderly_backend`), and tell the user in
-  one line that the set was remembered for this project. Never persist when
-  an entry already covers the repo - a later `--repos` on a known project is
-  a deliberate one-off override, not a redefinition.
-- Else read `~/.countersign/config.json`. If it has a `projects` object,
-  resolve each entry's `repos` and use the FIRST entry whose list contains
-  the plan's repo root: `REPOS` = that entry's full list. Membership, not
-  direction: a plan written in the backend repo of a backend+frontend
-  project resolves to BOTH repos, and so does one written in the frontend.
-- Legacy migration: if the config has a flat `repos` array and no `projects`
-  object, rewrite it in place as
-  `{"projects": {"migrated": {"repos": <that array>}}}` and tell the user in
-  one line. The old flat array applied one repo set to every plan on the
-  device, which linked the wrong repos when switching projects.
-- Otherwise (no config, or no entry contains the plan's repo root):
-  `REPOS` = the plan's repo root ALONE. Do not ask the user anything and do
-  not mention other projects' repos - a plan in an unconfigured repo is
-  reviewed against exactly that repo. If the plan is not inside a git
-  repository at all, pass no `--link-repo` flags (the engine then uses the
-  session's working directory as the workspace).
-
-## Step 4 - write the context brief
+## Step 3 - write the context brief
 
 This is how the headless agents inherit THIS conversation's context cheaply.
 Write `<plan-dir>/.countersign/<plan-stem>-context-brief.md` (create the
-`.countersign` dir; the per-plan name keeps concurrent runs on sibling plans
-from overwriting each other). Keep it under ~40 lines. It must capture, from
-this conversation and the plan itself:
+`.countersign` dir). Keep it under ~40 lines. It must capture, from this
+conversation and the plan itself:
 
 - INTENT: what problem this plan addresses and why now
 - CONSTRAINTS: technical constraints, existing decisions, things that must
-  not change (e.g. "reuse the existing production VAPID keys - new keys would
-  break existing subscribers")
+  not change
 - DECIDED: product decisions already made in-chat (these are final; the
   agents must not re-open them)
 - OUT OF SCOPE: what this effort explicitly does not touch
@@ -98,114 +64,75 @@ If this conversation has no relevant context (the plan was handed to you
 cold), derive the brief from the plan's own Goal/Non-goals sections and say
 so in the brief.
 
-## Step 5 - run the engine
-
-Build and run with Bash (adjust flags from the parsed arguments):
+## Step 4 - run the engine
 
 ```bash
 NONCE="cs-$(date +%s)-$RANDOM$RANDOM"
 PYTHON="$(command -v python3 || command -v python)"
 "$PYTHON" "${CLAUDE_PLUGIN_ROOT}/scripts/countersign_loop.py" "<plan path>" \
-  --expect-sha256 "<hash you captured when reading the plan>" \
+  --expect-sha256 "<hash captured in step 1>" \
   --fork-invocation-nonce "$NONCE" \
-  $(printf -- '--link-repo %q ' "${REPOS[@]}") \
   --context-brief "<plan-dir>/.countersign/<plan-stem>-context-brief.md" \
   [--decisions "<decisions file>" (only when resuming after answers)] \
   [--implement] \
   [--max-iterations N (only when --iterations given)]
 ```
 
-- `${REPOS[@]}` are the repo paths resolved in Step 3.
-- If the plan's repo root (walk up from the plan file to the containing git
-  repository) has an `agent-review-rules.md`, also pass
-  `--review-rules "<that file>"`.
+The engine resolves everything else itself: the repo set (saved project
+sets matched by membership, else the plan's own repository - pass
+`--link-repo <path>` only when the human explicitly names repos to review
+against) and per-repo `agent-review-rules.md` (auto-detected at the plan's
+repo root).
+
 - LAUNCH THIS AS A BACKGROUND TASK, never a plain foreground Bash call: a
-  full loop (several headless review+revise rounds, each revise re-emitting
-  the ENTIRE plan) routinely runs longer than a tool's default foreground
-  timeout, and a killed run both wastes the in-flight iteration and can
-  strand the plan mid-write. Use the Bash tool's run_in_background mode (or,
-  where that is unavailable, `nohup <command> >> "<plan-dir>/.countersign/run.log" 2>&1 &`
-  and poll the log). The engine is built for this: stderr carries a progress
-  heartbeat while it runs, and stdout still ends with exactly ONE JSON line.
-- Do not filter or pipe the engine's output; it ends with ONE JSON line on
-  stdout that you must parse (in background mode: the last line of the
-  captured output file). Expect the run to take minutes - hence the
-  background launch.
-- The engine forks THIS conversation for the revise calls - automatically,
-  no flags, no decision to make. The nonce in the command above identifies
-  this exact chat (the command line carrying it is recorded in this chat's
-  transcript before the engine runs), so the fork target is derived, never
-  guessed. Re-triggering /countersign from this same chat re-forks the same
-  conversation; starting a NEW chat is the one and only way the context
-  resets. If a run ever seems anchored to stale context, the fix is a new
-  chat - by design, that is the only usage error left to make. The context
-  brief from Step 4 is still required: the reviewer (zcode) never sees the
-  forked conversation, only the brief.
+  full loop routinely runs longer than a foreground tool timeout. Use the
+  Bash tool's run_in_background mode. stderr carries a progress heartbeat;
+  stdout ends with exactly ONE JSON line (in background mode: the last line
+  of the captured output file). Do not filter or pipe the output.
+- The engine forks THIS conversation for the revise calls (the nonce
+  identifies this exact chat). The context brief is still required: the
+  reviewer (zcode) never sees the forked conversation, only the brief.
 
-## Step 6 - mediate the outcome
+## Step 5 - mediate the outcome
 
-Parse the last stdout line as JSON, surface any `warnings` in the report
-verbatim (they flag e.g. a plan/checkout mismatch), and branch on `outcome`:
+Parse the last stdout line as JSON, surface any `warnings` verbatim, and
+branch on `outcome`:
 
-- **consensus** - Consensus means the reviewer approved with ZERO objections
-  of any severity; improvement suggestions raised in earlier rounds were
-  incorporated by the drafter. Read the final plan. Tell the user three
-  things: (1) what changed between the first reviewed draft and the final
-  plan (the `<history_dir>/plan-v*.md` snapshots are the record, including
-  which reviewer suggestions were applied); (2) what the reviewer
-  explicitly VALIDATED as strong (`strengths` in the report - the parts of
-  the design that held up, so the user knows what not to second-guess);
-  (3) any `fyi_notes` from the report. If `implement_attempted` is true,
-  list the edited repos and remind the user changes are uncommitted
-  (`git diff` to review). Nothing is ever committed or pushed by this
-  command.
+- **consensus** - Read the final plan. Tell the user: (1) what changed
+  between the first reviewed draft and the final plan
+  (`<history_dir>/plan-v*.md` snapshots are the record); (2) what the
+  reviewer explicitly VALIDATED (`strengths` - what not to second-guess);
+  (3) any `fyi_notes`. If `implement_attempted` is true, list the edited
+  repos and remind the user changes are uncommitted. Nothing is ever
+  committed or pushed by plan mode.
 - **blocked-on-human** - Read `open_questions_file`. Ask the user each
   question IN THIS CHAT, showing options and the reviewer's recommendation.
-  After the user answers, fill the `answer` fields into that JSON, save it
-  as `<history_dir>/decisions.json`, and re-run the engine exactly as before
-  plus `--decisions "<history_dir>/decisions.json"`. Decisions are
-  CUMULATIVE across rounds: if a decisions.json from an earlier round
-  exists, keep its answered entries (this file may carry only the newest
-  delta - the engine also persists settled answers in
-  `<history_dir>/settled-decisions.json` and merges, the file's answer
-  winning on the same question). To change a settled answer, pass the new
-  answer via decisions.json; to drop one entirely, also remove it from
-  settled-decisions.json. Loop back to this step.
-- **blocked-on-branch** - Report which repos sit on main/master (nothing was
-  edited). Offer to create feature branches; if the user agrees, create
-  them, then re-run the engine unchanged. Loop back to this step.
-- **rate-limited** - Tell the user the 5h/weekly window appears spent; the
-  run's state is persisted (plan snapshots + reviews in `history_dir`), so
-  re-running later continues rather than re-spending earlier iterations.
-  Stop; do not retry automatically.
-- **revise-truncated** - The drafting agent's revision came back a small
-  fraction of the plan's size even after one re-ask: a truncated output
-  turn, not a real revision. The plan file was NOT modified - the last good
-  version stands. Tell the user, surface any `warnings` from the report,
-  and offer the real options: split the plan into smaller documents (each
-  revise round re-emits the FULL document, and plans near/above ~100KB
-  exceed one output turn), or make this round's revision together in-chat
-  and re-invoke on the updated file.
-- **locked** - Another countersign run holds this plan's lock AND its
-  process is alive - the engine automatically takes over locks left by dead
-  runs, so reaching this outcome means a run is genuinely active. Check for
-  a background task in this or another session. Tell the user; do not
-  delete the lock unless they confirm the other run is dead.
-- **plan-mismatch** - The plan on disk is NOT the version you read (wrong
-  branch/worktree or it changed under you). Do NOT proceed. Re-locate the
-  correct file, read it fresh, capture the new hash, tell the user what
-  happened, and re-invoke with the new `--expect-sha256`.
-- **no-consensus** - Show the remaining blocking AND minor objections from
-  the report verbatim (minors are improvement suggestions the reviewer still
-  wants made). Offer the user the real options: raise `--iterations`, revise
-  the plan together in-chat first, or accept the disagreement and stop.
-- **error** - Show `error` from the report and the tail of the engine's
-  stderr output; suggest the likely fix.
-- **interrupted** - The engine was killed/signalled mid-run (host session
-  ended, machine slept). The lock was released and the plan file holds its
-  last fully-written version - nothing was corrupted. Re-run the engine
-  exactly as before to continue from the persisted state.
+  After the user answers, fill the `answer` fields, save as
+  `<history_dir>/decisions.json`, and re-run the engine exactly as before
+  plus `--decisions "<file>"`. Decisions are CUMULATIVE: keep earlier
+  answered entries (`settled-decisions.json` also merges; the file's answer
+  wins). Loop back to this step.
+- **blocked-on-branch** - Report which repos sit on main/master (nothing
+  was edited). Offer to create feature branches; if the user agrees, create
+  them, then re-run the engine unchanged.
+- **rate-limited** - The 5h/weekly window appears spent; state is
+  persisted, so re-running later continues rather than re-spending. Stop.
+- **revise-truncated** - The revision came back a small fraction of the
+  plan's size even after one re-ask. The plan file was NOT modified. Offer
+  the real options: split the plan, or revise together in-chat and
+  re-invoke.
+- **locked** - Another run genuinely holds this plan's lock (dead runs'
+  locks are taken over automatically). Check for a background task; do not
+  delete the lock unless the human confirms the other run is dead.
+- **plan-mismatch** - The plan on disk is NOT the version you read. Do NOT
+  proceed. Re-locate, re-read, re-hash, tell the user what happened,
+  re-invoke with the new `--expect-sha256`.
+- **no-consensus** - Show the remaining blocking AND minor objections
+  verbatim. Options: raise `--iterations`, revise in-chat first, or accept
+  the disagreement and stop.
+- **error** - Show `error` and the stderr tail; suggest the likely fix.
+- **interrupted** - The engine was killed mid-run; lock released, plan
+  intact at its last fully-written version. Re-run unchanged to continue.
 
-When re-running the engine (any branch above), always reuse the same plan
-path and flags, adding only what that branch requires; generate a fresh
-NONCE each time (any new value identifies this same chat identically).
+When re-running, always reuse the same plan path and flags, adding only
+what that branch requires; generate a fresh NONCE each time.

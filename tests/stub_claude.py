@@ -21,7 +21,15 @@ import sys
 from pathlib import Path
 
 prompt = sys.stdin.read()
-if "Implement the plan" in prompt:
+if "VERIFY FIX" in prompt:
+    # verify-stage fixer: touch a file in cwd (proves it ran against the
+    # workspace) and reply with the fix summary the next review round must see
+    marker = Path.cwd() / "verify-fix-applied.txt"
+    count = int(marker.read_text().strip() or 0) + 1 if marker.exists() else 1
+    marker.write_text(str(count), encoding="utf-8")
+    result = (f"stub fix round {count}: guarded the empty-input case in "
+              "src/handler.py and added a regression test")
+elif "Implement the plan" in prompt:
     (Path.cwd() / "stub-implement.txt").write_text("implemented by stub\n", encoding="utf-8")
     result = "stub implement pass done"
 elif "REVIEWER OBJECTIONS" in prompt:

@@ -1,29 +1,48 @@
 # countersign
 
-A Claude Code plugin that runs a two-agent consensus loop on a planning
-document: the interactive Claude session (which holds your conversation
-context) is the drafter of record; ZCode (GLM) reviews the plan headlessly;
-a headless claude session applies each revision — back and forth, fully
-self-driven, until the reviewer approves with zero outstanding objections.
-Product decisions escalate to you
-in the chat; nothing is ever committed or pushed automatically.
+A Claude Code plugin for two-agent consensus with a headless ZCode (GLM)
+reviewer. Two entry points:
+
+- **countersign skill — the default path.** When you ask your session to
+  "implement <discussed change> using countersign", the session derives a
+  short intent doc from the conversation, the consensus loop hardens it,
+  the session implements on a feature branch, and a headless verify stage
+  reviews the diff against the agreed intent, fixes blocking objections,
+  and commits (branch-guarded). Chat to verified commit without leaving
+  the conversation.
+- **`/countersign` command — plan mode, opt-in.** Dual-agent consensus on
+  a planning document BEFORE implementation: the interactive session
+  (drafter of record) writes a plan; GLM reviews it headlessly; a headless
+  claude session applies each revision — back and forth, fully self-driven,
+  until the reviewer approves with zero outstanding objections. For
+  design-heavy changes: architecture, data models, API contracts, security
+  boundaries, migrations.
 
 ```
-your planning doc (from the chat)
-        │
-        ▼
-  /countersign docs/plans/foo.md
-        │
-        ▼
-GLM (zcode headless) reviews ── objections ──> claude (headless) revises
-        │                                            │
-        │ open_questions (product/direction)         │ revised plan
-        ▼                                            ▼
-   YOU answer in chat  <── plugin mediates ──  loop until approve
-        │
-        ▼
-consensus: final plan (+ optional branch-guarded implement pass)
+skill flow (default):
+
+  chat discussion -> "implement using countersign"
+        |
+        v
+  intent doc (derived from the chat, ~50 lines)
+        |
+        v
+  consensus loop: GLM reviews <-> headless claude revises --> agreed intent
+        |                     (product questions stop for YOU)
+        v
+  session implements on a feature branch
+        |
+        v
+  verify stage: GLM reviews the diff AGAINST the intent
+        |            blocking objections -> headless fixer -> re-review
+        v
+  engine commits (never on main/master); you push
+
+plan mode (/countersign): your planning doc -> consensus loop -> final plan
 ```
+
+In both entry points, product decisions escalate to you in the chat;
+nothing is ever pushed.
 
 ## Install
 
@@ -78,19 +97,33 @@ serve headless prompts. Nonstandard install location? Pass
 
 ## Use
 
-Work on a plan in a normal Claude Code conversation — draft it, paste it,
-or point at an existing doc. Then:
+**Implement flow (skill):** discuss a change in a normal session, then say
+"implement this using countersign". The session writes the intent doc
+(`.countersign/intent-<slug>.md` next to your work), runs the consensus
+loop, implements on a feature branch, and runs verify — which reviews the
+full working-tree diff (merge-base with the default branch through the
+working tree, uncommitted and untracked changes included) against the
+agreed intent. Blocking objections loop through a headless fixer (default
+3 rounds); minors never block and are carried into the commit message. On
+a clean review the ENGINE commits each touched repo — as your git
+identity, no agent attribution, with a `countersign: verified` trailer.
+Push stays yours.
+
+**Plan mode (command):** work on a plan in a normal conversation — draft
+it, paste it, or point at an existing doc. Then:
 
 ```
 /countersign docs/plans/foo.md
 ```
 
-Optional flags:
+Optional flags (plan mode; the skill needs none — the engine resolves
+repos and rules itself):
 
 - `--implement` — after consensus, claude implements the plan (acceptEdits)
   in the repos the agents identified. Refuses to touch a repo on
   main/master; changes stay uncommitted.
-- `--iterations N` — raise the per-invocation review cap (default 4).
+- `--iterations N` — raise the per-invocation review cap (default 5; verify
+  rounds default 3).
 - `--repos A,B` — review against exactly these repos for this run. When the
   plan lives in one of them and the project isn't known yet, the set is
   remembered for that project (see below); on a known project it acts as a
@@ -102,7 +135,7 @@ Optional flags:
   `fresh` re-reviews independently each round (no anchoring on its own prior
   verdicts, at the cost of re-deriving everything every iteration).
 
-### What happens when you invoke it
+### What happens in plan mode when you invoke it
 
 1. The session writes a **context brief** (intent, constraints, decisions
    already made in-chat, out of scope) next to the plan — this is how the
@@ -197,8 +230,9 @@ example.
 
 | Path | Purpose |
 |---|---|
-| `commands/countersign.md` | The `/countersign` command: instructions the interactive session follows. |
-| `scripts/countersign_loop.py` | The engine: agent invocation, verdict parsing, retries/rate limits, implement passes. Full design doc in its docstring. |
+| `skills/countersign/SKILL.md` | The countersign skill: intent doc -> consensus -> implement -> verify -> commit. The default entry point, model-triggered. |
+| `commands/countersign.md` | The `/countersign` command: plan-consensus mode. Instructions the interactive session follows. |
+| `scripts/countersign_loop.py` | The engine: agent invocation, verdict parsing, retries/rate limits, verify + commit gate. Full design doc in its docstring. |
 | `tests/run_e2e.py` | End-to-end engine test with stub agents (zero model spend): `python3 tests/run_e2e.py` |
 
 ## Migrating from the terminal launcher (v0.1)
@@ -208,13 +242,17 @@ the only interface now. If you installed the old global `countersign`
 command, delete `~/.local/bin/countersign` and `countersign.cmd`. Existing
 workspaces under `~/.countersign/ws/` are reused as-is by the plugin.
 
-## Safety properties (unchanged from v0.1)
+## Safety properties
 
 - Product/company-direction decisions always stop for the human.
-- Implement passes refuse main/master BEFORE editing anything.
-- Git commit and push are never automated.
+- Verify-mode commits refuse main/master BEFORE staging anything, and only
+  happen after a clean review; plan mode never commits.
+- Git push is never automated.
+- The engine commits as the user's git identity with no agent attribution;
+  reviewer minor notes ride the commit message for the record.
 - API keys are never written to logs, stdout, or files.
-- Unparseable reviewer output is treated as a blocking objection, never approval.
+- Unparseable reviewer output is treated as a blocking objection, never
+  approval - and in verify mode, an unreadable review refuses to commit.
 - Plan revisions are written atomically (temp file + rename): a run killed
   mid-write leaves the previous version or the new one, never a truncated mix.
 - A run killed by SIGTERM/SIGHUP unwinds cleanly (`interrupted`, lock

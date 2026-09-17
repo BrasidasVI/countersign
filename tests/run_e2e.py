@@ -93,6 +93,10 @@ def make_repo(path, branch):
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", "-b", branch], cwd=path, check=True,
                    capture_output=True)
+    # repo-local identity: the ENGINE commits in verify mode, and a bare CI
+    # environment has no global git identity for it to inherit
+    subprocess.run(["git", "config", "user.email", "s@t"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=path, check=True)
     (path / "README.md").write_text("stub repo\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "-c", "user.email=s@t", "-c", "user.name=t",
@@ -454,6 +458,170 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
           rep.get("forked_from_session") == "sess-NONCE-0002",
           str(rep.get("forked_from_session")))
     check("nonce match logged", "nonce" in err.lower())
+
+    # ---------------- verify mode: diff review + commit gate ----------------
+
+    def gx(repo, *argv, check=True):
+        return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True,
+                              text=True, check=check)
+
+    def stub_key_state(key, suffix):
+        h = hashlib.md5(key.encode()).hexdigest()[:12]
+        return STATE_DIR / "cs-stub-state" / f"{h}.{suffix}"
+
+    def feature_work(repo, branch, name, content):
+        gx(repo, "checkout", "-q", "-b", branch)
+        (repo / name).write_text(content, encoding="utf-8")
+
+    print("scenario V1: verify-clean reviews the working tree and commits")
+    planV1 = make_plan(repoA, "plan-v1.md",
+                       "# Verify the stub fix\n\nGoal: stub goal.\n")
+    feature_work(repoA, "feat/v1", "feat.txt", "feat line 1\n")
+    gx(repoA, "add", "feat.txt")
+    gx(repoA, "commit", "-m", "committed work")
+    (repoA / "feat.txt").write_text("feat line 1\nfeat line 2\n",
+                                    encoding="utf-8")            # uncommitted
+    (repoA / "untracked.txt").write_text("brand new\n", encoding="utf-8")
+    rc, rep, err = run_engine(planV1, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyclean",
+                              env_extra={"CS_STUB_KEY": "v1"})
+    check("verify exit 0", rc == 0, f"rc={rc} {err[-300:] if rc else ''}")
+    check("outcome verify-clean", rep and rep.get("outcome") == "verify-clean",
+          str(rep)[:200])
+    check("still on the feature branch",
+          gx(repoA, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feat/v1")
+    head_msg = gx(repoA, "log", "-1", "--format=%B").stdout
+    check("commit message carries intent title",
+          "Verify the stub fix" in head_msg, head_msg)
+    check("commit message carries trailer", "countersign: verified" in head_msg)
+    committed = gx(repoA, "show", "--name-only", "--format=").stdout.split()
+    check("committed change in the commit", "feat.txt" in committed, str(committed))
+    check("untracked file in the commit", "untracked.txt" in committed,
+          str(committed))
+    check("countersign artifacts NOT committed",
+          not any(".countersign" in f for f in committed), str(committed))
+    check("report carries commit sha",
+          bool(rep.get("commits")) and bool(rep["commits"][0].get("sha")),
+          json.dumps(rep.get("commits")))
+    v1hist = Path(rep["history_dir"])
+    v1diff = (v1hist / "verify-diff-v01.patch").read_text(encoding="utf-8")
+    check("diff snapshot written", (v1hist / "verify-diff-v01.patch").is_file())
+    check("diff covers committed + uncommitted + untracked",
+          "feat.txt" in v1diff and "untracked.txt" in v1diff)
+    check("diff excludes countersign artifacts", ".countersign" not in v1diff)
+    check("run summary persisted",
+          json.loads((v1hist / "run-summary.json").read_text(encoding="utf-8")
+                     )["outcome"] == "verify-clean")
+
+    print("scenario V2: blocking objection -> fixer -> clean -> commit")
+    planV2 = make_plan(repoA, "plan-v2.md", "# Plan V2\n\nGoal: stub goal.\n")
+    feature_work(repoA, "feat/v2", "v2.txt", "v2\n")
+    rc, rep, err = run_engine(planV2, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyonce",
+                              env_extra={"CS_STUB_KEY": "v2",
+                                         "CS_STUB_RECORD_PROMPT": "1"})
+    check("fix-loop exit 0", rc == 0, f"rc={rc}")
+    check("fix-loop verify-clean", rep and rep.get("outcome") == "verify-clean")
+    v2hist = Path(rep["history_dir"])
+    check("two diff snapshots (pre- and post-fix)",
+          (v2hist / "verify-diff-v01.patch").is_file()
+          and (v2hist / "verify-diff-v02.patch").is_file())
+    check("fixer ran against the workspace",
+          any((p / "verify-fix-applied.txt").is_file()
+              for p in Path.home().joinpath(".countersign", "ws").glob("*")
+              if p.is_dir()))
+    lastprompt = stub_key_state("v2", "lastprompt")
+    check("round-2 review saw the fixer's summary",
+          lastprompt.is_file() and "stub fix round 1" in lastprompt.read_text(
+              encoding="utf-8"))
+    check("round-2 review saw the round-1 blocking objection",
+          "empty input crashes" in lastprompt.read_text(encoding="utf-8"))
+    check("verify reviewer chained within the stage",
+          stub_key_state("v2", "resumes").read_text().split() == ["stub-zcode-1"],
+          stub_key_state("v2", "resumes").read_text() if
+          stub_key_state("v2", "resumes").exists() else "(none)")
+    check("fix-loop commit landed on the feature branch",
+          gx(repoA, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feat/v2"
+          and "countersign: verified" in gx(repoA, "log", "-1", "--format=%B").stdout)
+
+    print("scenario V3: minors approve without another round, ride the message")
+    planV3 = make_plan(repoA, "plan-v3.md", "# Plan V3\n\nGoal: stub goal.\n")
+    feature_work(repoA, "feat/v3", "v3.txt", "v3\n")
+    rc, rep, err = run_engine(planV3, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyminors",
+                              env_extra={"CS_STUB_KEY": "v3"})
+    check("minors exit 0", rc == 0, f"rc={rc}")
+    check("minors outcome verify-clean",
+          rep and rep.get("outcome") == "verify-clean")
+    check("minors did NOT keep the loop alive (one reviewer call)",
+          stub_key_state("v3", "count").read_text().strip() == "1",
+          stub_key_state("v3", "count").read_text().strip())
+    check("minor note carried into the commit message",
+          "extract the retry" in gx(repoA, "log", "-1", "--format=%B").stdout)
+
+    print("scenario V4: persistent blockers -> verify-no-consensus, no commit")
+    planV4 = make_plan(repoA, "plan-v4.md", "# Plan V4\n\nGoal: stub goal.\n")
+    feature_work(repoA, "feat/v4", "v4.txt", "v4\n")
+    commits_before = gx(repoA, "rev-list", "--count", "HEAD").stdout.strip()
+    rc, rep, err = run_engine(planV4, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyblock",
+                              env_extra={"CS_STUB_KEY": "v4"})
+    check("cap exit 6", rc == 6, f"rc={rc}")
+    check("outcome verify-no-consensus",
+          rep and rep.get("outcome") == "verify-no-consensus", str(rep)[:160])
+    check("blocking objections remain in the report",
+          bool(rep.get("blocking_remaining")), str(rep.get("blocking_remaining"))[:120])
+    check("no commit made",
+          gx(repoA, "rev-list", "--count", "HEAD").stdout.strip() == commits_before)
+    check("working tree left with the last fix round",
+          "v4.txt" in gx(repoA, "status", "--porcelain").stdout)
+
+    print("scenario V5: commit gate refuses main/master before staging")
+    planV5 = make_plan(repoA, "plan-v5.md", "# Plan V5\n\nGoal: stub goal.\n")
+    gx(repoA, "checkout", "-q", "main")
+    (repoA / "README.md").write_text("dirty on main\n", encoding="utf-8")
+    commits_before = gx(repoA, "rev-list", "--count", "HEAD").stdout.strip()
+    rc, rep, err = run_engine(planV5, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyclean",
+                              env_extra={"CS_STUB_KEY": "v5"})
+    check("guard exit 5", rc == 5, f"rc={rc}")
+    check("outcome blocked-on-branch",
+          rep and rep.get("outcome") == "blocked-on-branch", str(rep)[:160])
+    check("branch-blocked repo named",
+          bool(rep.get("branch_blocked_repos")), str(rep.get("branch_blocked_repos")))
+    check("no commit on main",
+          gx(repoA, "rev-list", "--count", "HEAD").stdout.strip() == commits_before)
+    check("nothing staged (change still unstaged)",
+          " M README.md" in gx(repoA, "status", "--porcelain").stdout)
+
+    print("scenario V7: open question mid-verify stops, decisions resume")
+    planV7 = make_plan(repoA, "plan-v7.md", "# Plan V7\n\nGoal: stub goal.\n")
+    feature_work(repoA, "feat/v7", "v7.txt", "v7\n")
+    rc, rep, err = run_engine(planV7, [repoA, repoB], extra=["--verify"],
+                              stub_mode="verifyopenq",
+                              env_extra={"CS_STUB_KEY": "v7"})
+    check("verify openq exit 4", rc == 4, f"rc={rc}")
+    check("verify openq blocked-on-human",
+          rep and rep.get("outcome") == "blocked-on-human")
+    oqf = Path(rep["open_questions_file"])
+    qs = json.loads(oqf.read_text(encoding="utf-8"))
+    qs[0]["answer"] = "flag on"
+    dec = oqf.parent / "decisions.json"
+    dec.write_text(json.dumps(qs, indent=2), encoding="utf-8")
+    rc2, rep2, err2 = run_engine(planV7, [repoA, repoB],
+                                 extra=["--verify", "--decisions", str(dec)],
+                                 stub_mode="verifyopenq",
+                                 env_extra={"CS_STUB_KEY": "v7"})
+    check("decisions resume exit 0", rc2 == 0, f"rc={rc2}")
+    check("decisions resume verify-clean",
+          rep2 and rep2.get("outcome") == "verify-clean")
+    check("decision recorded in report",
+          rep2.get("decisions", {}).get("Ship the verified fix behind a flag?")
+          == "flag on")
+    check("resumed reviewer chains across verify invocations",
+          stub_key_state("v7", "resumes").read_text().split() == ["stub-zcode-1"])
+    check("resume commit landed",
+          "countersign: verified" in gx(repoA, "log", "-1", "--format=%B").stdout)
 
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
     sys.exit(1 if failures else 0)

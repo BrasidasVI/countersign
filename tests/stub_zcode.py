@@ -33,16 +33,22 @@ from pathlib import Path
 args = sys.argv[1:]
 attach = None
 resume = None
+prompt_text = None
 for i, a in enumerate(args):
     if a == "--attach" and i + 1 < len(args):
         attach = args[i + 1]
     if a == "--resume" and i + 1 < len(args):
         resume = args[i + 1]
+    if a == "--prompt" and i + 1 < len(args):
+        prompt_text = args[i + 1]
 
 mode = os.environ.get("CS_STUB_MODE", "revise")
 state_dir = Path(os.environ.get("CS_STUB_STATE_DIR", tempfile.gettempdir())) / "cs-stub-state"
 state_dir.mkdir(parents=True, exist_ok=True)
-key = hashlib.md5((attach or "none").encode()).hexdigest()[:12]
+# CS_STUB_KEY overrides the per-attach key: verify rounds attach round-varying
+# patch files, so verify scenarios pin the count to one stable key.
+key_source = os.environ.get("CS_STUB_KEY") or attach or "none"
+key = hashlib.md5(key_source.encode()).hexdigest()[:12]
 counter = state_dir / f"{key}.count"
 n = (int(counter.read_text()) if counter.exists() else 0) + 1
 counter.write_text(str(n))
@@ -50,11 +56,73 @@ if resume:
     # recorded so the e2e suite can assert the reviewer actually chains
     with open(state_dir / f"{key}.resumes", "a", encoding="utf-8") as f:
         f.write(resume + "\n")
+if prompt_text is not None and os.environ.get("CS_STUB_RECORD_PROMPT"):
+    (state_dir / f"{key}.lastprompt").write_text(prompt_text, encoding="utf-8")
 
 if mode == "hang":
     # Reviewer never answers: lets the e2e suite SIGTERM the engine mid-call
     # and assert the unwind (lock released, interrupted report on stdout).
     time.sleep(600)
+
+# ---- verify-stage modes (severity-gated: blocking gates, minors do not) ----
+if mode in ("verifyclean", "verifyonce", "verifyminors", "verifyblock",
+            "verifyopenq"):
+    if mode == "verifyblock" or (mode == "verifyonce" and n == 1):
+        verdict = {
+            "verdict": "revise",
+            "objections": [{"severity": "blocking",
+                            "point": "stub blocking: empty input crashes the "
+                                     "handler at src/handler.py:42",
+                            "suggestion": "stub suggestion: guard the empty "
+                                          "case and add a test"}],
+            "open_questions": [],
+            "fyi_notes": [],
+            "repos_touched": ["repoa"],
+            "strengths": ["stub strength: the change matches the intent"],
+            "summary": "stub verify wants a fix",
+        }
+    elif mode == "verifyminors" and n == 1:
+        verdict = {
+            "verdict": "approve",
+            "objections": [{"severity": "minor",
+                            "point": "stub verify minor: extract the retry "
+                                     "loop into a helper",
+                            "suggestion": "stub suggestion: helper function"}],
+            "open_questions": [],
+            "fyi_notes": [],
+            "repos_touched": ["repoa"],
+            "strengths": ["stub strength: implementation satisfies the intent"],
+            "summary": "stub verify approves with a minor note",
+        }
+    elif mode == "verifyopenq" and n == 1:
+        verdict = {
+            "verdict": "approve",
+            "objections": [],
+            "open_questions": [{"question": "Ship the verified fix behind a flag?",
+                                "why": "controls rollout risk",
+                                "options": ["flag on", "flag off"],
+                                "recommendation": "flag on"}],
+            "fyi_notes": [],
+            "repos_touched": ["repoa"],
+            "strengths": ["stub strength: implementation satisfies the intent"],
+            "summary": "stub verify needs a human decision",
+        }
+    else:
+        verdict = {
+            "verdict": "approve",
+            "objections": [],
+            "open_questions": [],
+            "fyi_notes": ["stub verify fyi: everything looks fine"],
+            "repos_touched": ["repoa"],
+            "strengths": ["stub strength: implementation satisfies the intent"],
+            "summary": "stub verify approval",
+        }
+    print(json.dumps({
+        "response": json.dumps(verdict),
+        "sessionId": f"stub-zcode-{n}",
+        "usage": {"input_tokens": 1000, "output_tokens": 50},
+    }))
+    sys.exit(0)
 
 if mode == "openq2" and n <= 2:
     # Same two questions on both calls: if earlier answers were lost between

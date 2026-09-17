@@ -15,6 +15,18 @@ Role division:
 Input contract: the plan document ALREADY EXISTS on disk (the interactive
 session wrote it). This engine never drafts from scratch.
 
+Verify mode (--verify, 0.8.0): the positional file is the CONSENSUS INTENT
+doc. The engine diffs every linked repo from the merge-base with its
+default branch through the working tree (committed, uncommitted and
+intent-to-add untracked changes; countersign's own artifacts excluded),
+reviews the diff against the intent doc with the same verdict schema -
+BLOCKING objections gate the loop, minors are recorded and ride into the
+commit message - has a forked headless claude fix the working tree between
+rounds, and on a clean review COMMITS each touched repo: refusing
+main/master before any staging, never pushing. Reviewer seeding is per
+stage: verify resumes its own verify-review-iter-* sessions, never the
+consensus stage's review-iter-* ones.
+
 Invocation (what the plugin command runs):
   python3 countersign_loop.py PLAN.md \
       --link-repo <backend> --link-repo <frontend> \
@@ -26,7 +38,8 @@ Output contract (stable, machine-read by the plugin command):
   - stderr: human-readable progress logs (also streamed to the chat).
   - exit codes: 0 consensus | 2 error/rate-limited | 3 no-consensus |
     4 blocked-on-human (questions need answers -> --decisions) |
-    5 blocked-on-branch (implement target on main/master; nothing edited).
+    5 blocked-on-branch (implement target on main/master; nothing edited) |
+    6 verify-no-consensus (--verify: blocking diff objections remain).
   - a revise reply that is a fraction of the plan's size is treated as a
     truncated output turn: one re-ask, then outcome "revise-truncated" with
     the plan file left untouched at its last good state.
@@ -87,8 +100,12 @@ EXIT_ERROR = 2
 EXIT_NO_CONSENSUS = 3
 EXIT_BLOCKED_ON_HUMAN = 4
 EXIT_BLOCKED_ON_BRANCH = 5
+EXIT_VERIFY_NO_CONSENSUS = 6
 
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_VERIFY_ITERATIONS = 3
+VERIFY_DIFF_ATTACH_CAP_CHARS = 120_000   # above this, the diff is reviewed per file
+COMMIT_TRAILER = "countersign: verified"
 DEFAULT_TIMEOUT_SECS = 900
 DEFAULT_HEARTBEAT_SECS = 30
 HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main()
@@ -949,6 +966,7 @@ class Config:
     retry_base_delay: int = 30
     review_parse_retries: int = 1
     implement_repos: list = field(default_factory=list)
+    link_repos: list = field(default_factory=list)   # resolved real repo paths (verify)
     heartbeat_secs: int = DEFAULT_HEARTBEAT_SECS
 
 
@@ -986,7 +1004,8 @@ def drafter(prompt: str, cfg: Config, session: Optional[str], mode: str,
                        permission_mode=mode, fork=fork, timeout=timeout)
 
 
-def reviewer(prompt: str, cfg: Config, session: Optional[str]) -> AgentResult:
+def reviewer(prompt: str, cfg: Config, session: Optional[str],
+             attach: Optional[Path] = None) -> AgentResult:
     if cfg.dry_run:
         log(f"DRY-RUN zcode (mode=plan, resume={'yes' if session else 'no'}, "
             f"attach={cfg.plan_path.name})")
@@ -998,7 +1017,8 @@ def reviewer(prompt: str, cfg: Config, session: Optional[str]) -> AgentResult:
                   '"options":["free","pro-only"],"recommendation":"free"}],'
                   '"summary":"dry-run"}'),
             session_id="dry-run")
-    return call_zcode(prompt, cwd=cfg.repo, cfg=cfg, attach=cfg.plan_path, session_id=session)
+    return call_zcode(prompt, cwd=cfg.repo, cfg=cfg,
+                      attach=attach or cfg.plan_path, session_id=session)
 
 
 @dataclass
@@ -1021,6 +1041,8 @@ class RunReport:
     implement_attempted: bool = False
     implement_refused: bool = False
     repos_touched: list = field(default_factory=list)
+    verify_mode: bool = False
+    commits: list = field(default_factory=list)   # [{repo, branch, sha}] on verify-clean
     branch_blocked_repos: list = field(default_factory=list)
     agent_models: dict = field(default_factory=dict)
     forked_from_session: Optional[str] = None
@@ -1590,6 +1612,570 @@ def settled_state_path(history_dir: Path) -> Path:
     return history_dir / "settled-decisions.json"
 
 
+# --------------------------------------------------------------------------
+# Verify mode: diff review against the consensus intent doc + commit gate
+# --------------------------------------------------------------------------
+
+def git_run(repo: Path, *argv: str, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(["git", "-C", str(repo), *argv], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+    if check and proc.returncode != 0:
+        raise OrchestratorError(
+            f"git -C {repo} {' '.join(argv[:3])} failed: "
+            f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    return proc
+
+
+def load_countersign_config() -> dict:
+    try:
+        data = json.loads((Path.home() / ".countersign" / "config.json")
+                          .read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_countersign_config(data: dict) -> None:
+    cfg_dir = Path.home() / ".countersign"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _config_project_members(entry: dict) -> list[Path]:
+    return [Path(str(p)).expanduser().resolve() for p in entry.get("repos", [])]
+
+
+def resolve_repo_set(plan_path: Path) -> list[Path]:
+    """Glue absorbed from the plugin command (0.8.0): repo-set resolution for
+    runs that pass no --link-repo. Membership matching on resolved paths: a
+    plan inside any member repo resolves to the whole project set; otherwise
+    the plan's own repository alone; no repository -> empty set (workspace
+    falls back to the working directory). Also migrates the pre-0.4 flat
+    device-wide repos array into a project entry, as the command used to."""
+    root = _git_repo_root(plan_path.parent)
+    data = load_countersign_config()
+    if root is not None:
+        projects = data.get("projects")
+        if not isinstance(projects, dict) and isinstance(data.get("repos"), list):
+            data = {"projects": {"migrated": {"repos": data["repos"]}}}
+            save_countersign_config(data)
+            log("migrated legacy flat repos array into a 'migrated' project entry")
+        for name, entry in (data.get("projects") or {}).items():
+            members = _config_project_members(entry or {})
+            if root.resolve() in members:
+                log(f"repo set: project '{name}' "
+                    f"({len(members)} repo(s), membership match)")
+                return members
+        log(f"repo set: {root} (the plan's own repository)")
+        return [root]
+    log("repo set: none (plan is outside any git repository)")
+    return []
+
+
+def remember_project_set(explicit: list[Path], plan_path: Path) -> None:
+    """Persist an explicit --link-repo set for this project, once: only when
+    the plan's own repo is in the set and no saved entry already covers it -
+    a later explicit set on a known project is a one-off override."""
+    root = _git_repo_root(plan_path.parent)
+    if root is None:
+        return
+    resolved = [p.expanduser().resolve() for p in explicit]
+    if root.resolve() not in resolved:
+        return
+    data = load_countersign_config()
+    for entry in (data.get("projects") or {}).values():
+        if root.resolve() in _config_project_members(entry or {}):
+            return
+    projects = data.setdefault("projects", {})
+    projects[root.name] = {"repos": [str(p) for p in resolved]}
+    save_countersign_config(data)
+    log(f"repo set remembered for project '{root.name}' "
+        f"({len(resolved)} repo(s))")
+
+
+def git_default_branch(repo: Path) -> Optional[str]:
+    """The repo's main line, local first then origin; None if neither exists."""
+    for ref in ("refs/heads/main", "refs/heads/master",
+                "refs/remotes/origin/main", "refs/remotes/origin/master"):
+        if git_run(repo, "rev-parse", "--verify", "--quiet", ref,
+                   check=False).returncode == 0:
+            return ref
+    return None
+
+
+def artifact_excludes(repo: Path, plan_path: Path) -> list[str]:
+    """Git pathspecs keeping countersign's own artifacts out of the reviewed
+    diff and out of the commit: the WHOLE `<plan dir>/.countersign` tree
+    (every plan's history lives there) plus the intent/plan doc itself. A
+    directory pathspec matches everything under it."""
+    specs = []
+    for p in [plan_path.parent / ".countersign", plan_path]:
+        try:
+            rel = p.resolve().relative_to(repo.resolve())
+        except ValueError:
+            continue
+        specs.append(f":(exclude){rel.as_posix()}")
+    return specs
+
+
+def collect_repo_diff(repo: Path, excludes: list[str]) -> dict:
+    """Diff one repo from the merge-base with its default branch through the
+    WORKING TREE: committed + uncommitted changes, plus untracked files via
+    intent-to-add. Countersign artifacts are excluded by pathspec."""
+    branch = _git_branch(repo)
+    default = git_default_branch(repo)
+    specs = ["."] + excludes
+    git_run(repo, "add", "-N", "--", *specs)
+    if default:
+        base = git_run(repo, "merge-base", "HEAD", default).stdout.strip()
+        diff = git_run(repo, "diff", base, "--", *specs).stdout
+    else:
+        # No main line (fresh repo with a single branch): diffing the empty
+        # tree would report every committed file as new, so fall back to HEAD
+        # - uncommitted changes only - and say so.
+        log(f"note: {repo.name} has no main/master branch - reviewing "
+            "UNCOMMITTED changes only")
+        diff = git_run(repo, "diff", "HEAD", "--", *specs).stdout
+    return {"repo": repo, "branch": branch, "diff": diff}
+
+
+def combine_diffs(per_repo: list[dict]) -> str:
+    parts = []
+    for r in per_repo:
+        header = f"### repo: {r['repo'].name} (branch {r['branch']})"
+        parts.append(header + "\n" + (r["diff"].strip() or "(no changes)"))
+    return "\n".join(parts)
+
+
+def split_diff_by_file(diff_text: str) -> list[str]:
+    """Split a combined git diff into per-file patches (batching fallback for
+    diffs above the attach cap)."""
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current:
+            chunks.append("".join(current))
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("".join(current))
+    return [c for c in chunks if any(l.startswith("diff --git ") for l in c.splitlines())]
+
+
+def build_verify_review_prompt(intent_name: str, intent_text: str, rules_text: str,
+                               settled: dict, ledger: list, batch_note: str = "") -> str:
+    base = (
+        "You are the reviewing agent in a two-agent workflow, VERIFY stage. An "
+        f"implementation of the agreed intent ({intent_name}) has been written "
+        "to the working tree of the linked repositories. Review the attached "
+        "git diff (merge-base..working tree) AGAINST THE AGREED INTENT: the "
+        "question is not 'is this design sound' (already settled) but 'does "
+        "this code satisfy the agreed intent, constraints and approach'.\n"
+        "\n"
+        "Respond with ONLY a single JSON object, no markdown fences, "
+        "no prose before or after it:\n"
+        '{"verdict": "approve" or "revise", '
+        '"objections": [{"severity": "blocking" or "minor", '
+        '"point": "what is wrong (cite file:line from the diff) and why it matters", '
+        '"suggestion": "the concrete change that would resolve it"}], '
+        '"strengths": ["what the implementation does right - concrete validation"], '
+        '"open_questions": [{"question": "a decision only the human product owner can make", '
+        '"why": "what it affects", "options": ["realistic option", "..."], '
+        '"recommendation": "your recommended option and one-line reason"}], '
+        '"fyi_notes": ["observation the human should be aware of, 1-2 sentences"], '
+        '"repos_touched": ["repo names with changes; empty list is fine in verify stage"], '
+        '"summary": "a few sentences of overall assessment"}\n'
+        "\n"
+        "Rules:\n"
+        '- verdict "approve" iff there are ZERO BLOCKING objections and '
+        "open_questions is empty. MINOR objections do NOT block approval - "
+        "list them; they are recorded and reported to the human.\n"
+        "- Every objection must cite file:line from the attached diff.\n"
+        "- Actively look for implementation flaws a plan review cannot see: "
+        "unhandled edge cases, error handling, concurrency, security, drift "
+        "from the intent's APPROACH, and missing or hollow tests relative to "
+        "what the intent promised.\n"
+        "- A fix round happened between reviews when the ledger below shows "
+        "one: re-check earlier blocking objections AND re-scan the sections "
+        "the fix touched for regressions - the fix summary is the fixer's "
+        "claim, not proof.\n"
+        "- Product/direction decisions belong to the human (open_questions); "
+        "technical decisions are the fixer's to make.\n"
+        "\n"
+        "Required invariants - a diff that violates ANY of these MUST get "
+        'verdict "revise" with the violation reported as a BLOCKING objection:\n'
+        f"{rules_text}"
+    )
+    if batch_note:
+        base += "\n" + batch_note + "\n"
+    base += (
+        "\n=== INTENT DOC (the agreed rubric) ===\n"
+        f"{intent_text}\n"
+        "=== END INTENT ==="
+    )
+    if ledger:
+        base += "\n\n=== PRIOR VERIFY ROUNDS (objections raised -> fixer's claimed changes) ==="
+        for entry in ledger:
+            obs = "; ".join(o.get("point", "")[:200] for o in entry["blocking"])
+            base += (f"\n- round {entry['round']}: BLOCKING: {obs}\n"
+                     f"  fixer claimed: {entry['fix_summary']}")
+        base += "\n=== END PRIOR ROUNDS ==="
+    if settled:
+        base += (
+            "\n\nSettled human decisions (authoritative; do NOT re-open these, "
+            "re-ask them, or object to them):\n"
+            + "".join(f"- Q: {q}\n  A: {a}\n" for q, a in settled.items())
+        )
+    return base
+
+
+def build_verify_fix_prompt(intent_text: str, objections_json: str,
+                            prior_summaries: list) -> str:
+    base = (
+        "VERIFY FIX: you are the fixing agent in the countersign VERIFY stage. "
+        "The working trees of the linked repositories (visible in this working "
+        "directory) hold an implementation that the reviewer found BLOCKING "
+        "objections against. Edit the working tree files to resolve EVERY "
+        "blocking objection.\n"
+        "\n"
+        "Rules:\n"
+        "- Change only what the objections require plus what is directly "
+        "implied by them; the agreed intent below is the contract.\n"
+        "- Run the tests if the environment allows; do not weaken tests to "
+        "make them pass.\n"
+        "- Do NOT git add, commit or push anything.\n"
+        "- Reply with a SHORT summary (at most ~10 lines) of exactly what you "
+        "changed and why - your reply is fed verbatim to the next review "
+        "round.\n"
+        "\n"
+        f"=== INTENT DOC (the agreed rubric) ===\n{intent_text}\n=== END INTENT ===\n"
+        "\n"
+        f"=== REVIEWER OBJECTIONS (JSON) ===\n{objections_json}\n=== END OBJECTIONS ==="
+    )
+    if prior_summaries:
+        base += "\n\n=== YOUR EARLIER FIX SUMMARIES ===\n" + \
+            "\n".join(f"- {s}" for s in prior_summaries)
+    return base
+
+
+def build_commit_message(intent_path: Path, intent_text: str, minors: list) -> str:
+    title = None
+    for ln in intent_text.splitlines():
+        if ln.startswith("#"):
+            title = re.sub(r"^#+\s*", "", ln).strip()
+            break
+    lines = [title or f"Implement: {intent_path.stem}", ""]
+    lines.append(f"Implements the countersign-verified intent doc: {intent_path}")
+    for ob in minors:
+        point = str(ob.get("point", "")).strip()
+        if point:
+            lines.append(f"- reviewer minor: {point}")
+    lines.append(COMMIT_TRAILER)
+    return "\n".join(lines)
+
+
+def _merge_batch_verdicts(verdicts: list[Verdict]) -> Verdict:
+    merged = Verdict(approve=False, raw_ok=all(v.raw_ok for v in verdicts),
+                     blocking=[], minor=[], open_questions=[], fyi_notes=[],
+                     strengths=[], repos_touched=[],
+                     summary=" || ".join(v.summary for v in verdicts if v.summary),
+                     raw="\n".join(v.raw for v in verdicts))
+    seen = set()
+    for v in verdicts:
+        for attr in ("blocking", "minor", "open_questions", "fyi_notes",
+                     "strengths", "repos_touched"):
+            for item in getattr(v, attr):
+                key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else item
+                if key not in seen:
+                    seen.add(key)
+                    getattr(merged, attr).append(item)
+    return merged
+
+
+def review_verify_diff(cfg: Config, prompt: str, per_repo: list[dict],
+                       history_dir: Path, round_no: int, session: Optional[str],
+                       review_parse_retries: int) -> tuple[Verdict, Optional[str],
+                                                           list[dict]]:
+    """One review round over the combined diff; above the attach cap, review
+    per-file patches in batches and merge the verdicts. Returns the verdict,
+    the last reviewer sessionId (for chaining), and zcode usage entries."""
+    combined = combine_diffs(per_repo)
+    batches: list[tuple[str, Path]] = []
+    if len(combined) <= VERIFY_DIFF_ATTACH_CAP_CHARS:
+        patch = history_dir / f"verify-attach-v{round_no:02d}.patch"
+        patch.write_text(combined, encoding="utf-8")
+        batches.append(("", patch))
+    else:
+        log(f"combined diff {len(combined):,} chars exceeds attach cap - "
+            "reviewing per file")
+        chunks = split_diff_by_file(combined)
+        for k, chunk in enumerate(chunks, 1):
+            patch = history_dir / f"verify-attach-v{round_no:02d}-f{k}.patch"
+            patch.write_text(chunk, encoding="utf-8")
+            note = (f"(Reviewing file batch {k} of {len(chunks)}; judge ONLY "
+                    f"the files in the attached patch.)")
+            batches.append((note, patch))
+    verdicts: list[Verdict] = []
+    usages: list[dict] = []
+    session_id: Optional[str] = session
+    for note, patch in batches:
+        v = reviewer(prompt + note, cfg, session_id, attach=patch)
+        if not v.ok:
+            return (Verdict(approve=False, raw_ok=False, blocking=[], minor=[],
+                            open_questions=[], fyi_notes=[], strengths=[],
+                            repos_touched=[], summary="reviewer call failed",
+                            raw=""), None, usages)
+        session_id = v.session_id
+        usages.append(v.usage)
+        verdicts.append(parse_verdict(v.text))
+        for attempt in range(1, review_parse_retries + 1):
+            if verdicts[-1].raw_ok:
+                break
+            log(f"verify round {round_no}: reviewer reply was not valid JSON - "
+                f"re-asking (parse retry {attempt}/{review_parse_retries})")
+            v = reviewer(prompt + note +
+                         "\n\nIMPORTANT: your PREVIOUS reply was not valid JSON. "
+                         "Respond with ONLY the raw JSON object.", cfg,
+                         session_id, attach=patch)
+            if not v.ok:
+                return verdicts[-1], session_id, usages
+            session_id = v.session_id
+            usages.append(v.usage)
+            verdicts[-1] = parse_verdict(v.text)
+    return _merge_batch_verdicts(verdicts), session_id, usages
+
+
+def run_verify(cfg: Config, report: RunReport) -> int:
+    """The VERIFY stage: review the working-tree diff of every linked repo
+    against the consensus intent doc, fix blocking objections headlessly
+    between rounds, and commit on a clean review. Blocking objections gate
+    the loop; minors are recorded and ride into the commit message."""
+    report.verify_mode = True
+    usage_by_agent: dict = {"claude": {}, "zcode": {}}
+    report.usage = usage_by_agent
+    if not cfg.dry_run:
+        cfg.history_dir.mkdir(parents=True, exist_ok=True)
+
+    def accumulate(usage: dict, agent: str) -> None:
+        for k, v in usage.items():
+            if isinstance(v, (int, float)):
+                usage_by_agent[agent][k] = usage_by_agent[agent].get(k, 0) + v
+
+    settled: dict = load_settled_state(cfg.history_dir) if not cfg.dry_run else {}
+    if cfg.decisions_file:
+        settled.update(load_decisions_file(cfg.decisions_file))
+    if settled:
+        if not cfg.dry_run:
+            persist_settled_state(cfg.history_dir, settled)
+        report.decisions = dict(settled)
+        log(f"loaded {len(settled)} human decision(s)")
+
+    intent_text = cfg.plan_path.read_text(encoding="utf-8").strip()
+    if not intent_text:
+        report.error = f"intent doc {cfg.plan_path} is empty"
+        log(f"ERROR {report.error}")
+        return EXIT_ERROR
+    log(f"verify rubric (intent doc): {cfg.plan_path} ({len(intent_text)} chars); "
+        f"agents' workspace: {cfg.repo}")
+
+    repos = [Path(str(p)) for p in cfg.link_repos]
+    if not repos:
+        report.error = ("verify mode needs at least one linked repository - "
+                        "run inside the project's git repository (or pass "
+                        "--link-repo) so there is a working tree to diff")
+        log(f"ERROR {report.error}")
+        return EXIT_ERROR
+
+    artifacts_plan = cfg.plan_path
+    excludes = {r: artifact_excludes(r, artifacts_plan) for r in repos}
+
+    # Per-stage reviewer seeding (Resolved decision 2): verify resumes its OWN
+    # stage's sessions, never the consensus stage's review-iter-* ones.
+    reviewer_session: Optional[str] = None
+    if cfg.strategy == "chained" and not cfg.dry_run:
+        for p in sorted(cfg.history_dir.glob("verify-review-iter-*.json"), reverse=True):
+            try:
+                sid = json.loads(p.read_text(encoding="utf-8")).get("sessionId")
+            except (OSError, ValueError):
+                continue
+            if sid:
+                reviewer_session = sid
+                log(f"verify reviewer chaining: resuming session recorded in {p.name}")
+                break
+
+    ledger: list = []
+    minors_total: list = []
+    drafter_session: Optional[str] = None
+    last_verdict: Optional[Verdict] = None
+    iterations_used = 0
+
+    for i in range(1, cfg.max_iterations + 1):
+        iterations_used = i
+        report.iterations_used = i
+        log(f"verify round {i}/{cfg.max_iterations}: diffing "
+            f"{len(repos)} repo(s) against the intent")
+        per_repo = [collect_repo_diff(r, excludes[r]) for r in repos]
+        touched = [r for r in per_repo if r["diff"].strip()]
+        if not touched:
+            report.outcome = "error"
+            report.error = ("no changes found in the linked repositories' "
+                            "working trees - implement the agreed intent first, "
+                            "then run verify")
+            log(f"ERROR {report.error}")
+            return EXIT_ERROR
+        if not cfg.dry_run:
+            write_atomic(cfg.history_dir / f"verify-diff-v{i:02d}.patch",
+                         combine_diffs(per_repo) + "\n")
+        prompt = build_verify_review_prompt(cfg.plan_path.name, intent_text,
+                                            cfg.review_rules, settled, ledger)
+        verdict, reviewer_session, zcode_usages = review_verify_diff(
+            cfg, prompt, per_repo, cfg.history_dir, i, reviewer_session,
+            cfg.review_parse_retries)
+        last_verdict = verdict
+        for u in zcode_usages:
+            accumulate(u, "zcode")
+        if not verdict.raw_ok:
+            # Same safety property as plan mode, starker stakes here: an
+            # unreadable review must never be the basis of a commit.
+            report.outcome = "error"
+            report.error = (f"verify round {i}: reviewer reply was not valid "
+                            "JSON even after retry - refusing to commit on an "
+                            "unreadable review; re-run verify")
+            log(f"ERROR {report.error}")
+            return EXIT_ERROR
+        if not cfg.dry_run:
+            (cfg.history_dir / f"verify-review-iter-{i:02d}.json").write_text(
+                json.dumps({"verdict": verdict.raw_ok and not verdict.blocking
+                            and not verdict.open_questions,
+                            "raw_ok": verdict.raw_ok,
+                            "blocking": verdict.blocking, "minor": verdict.minor,
+                            "open_questions": verdict.open_questions,
+                            "fyi_notes": verdict.fyi_notes,
+                            "strengths": verdict.strengths,
+                            "summary": verdict.summary, "raw": verdict.raw,
+                            # the hook the next invocation's per-stage
+                            # reviewer seeding resumes from
+                            "sessionId": reviewer_session},
+                           indent=2, ensure_ascii=False), encoding="utf-8")
+        log(f"verify round {i}: {len(verdict.blocking)} blocking, "
+            f"{len(verdict.minor)} minor, "
+            f"{len(verdict.open_questions)} open question(s) - {verdict.summary[:100]}")
+        for s in verdict.strengths:
+            if s not in report.strengths:
+                report.strengths.append(s)
+        for note in verdict.fyi_notes:
+            if note not in report.fyi_notes:
+                report.fyi_notes.append(note)
+        for m in verdict.minor:
+            if m not in minors_total:
+                minors_total.append(m)
+
+        if verdict.open_questions:
+            fresh = [q for q in verdict.open_questions if q["question"] not in settled]
+            if fresh:
+                oq_path = cfg.history_dir / "open-questions.json"
+                if not cfg.dry_run:
+                    oq_path.write_text(
+                        json.dumps([{**q, "answer": ""} for q in fresh],
+                                   indent=2, ensure_ascii=False), encoding="utf-8")
+                report.open_questions_file = str(oq_path)
+                report.outcome = "blocked-on-human"
+                report.open_questions = fresh
+                log(f"BLOCKED ON HUMAN: {len(fresh)} question(s) written to {oq_path}; "
+                    "re-run with --decisions after answering")
+                return EXIT_BLOCKED_ON_HUMAN
+
+        if not verdict.blocking:
+            last_verdict = verdict
+            break
+        if i == cfg.max_iterations:
+            break
+
+        objections_json = json.dumps(
+            {"verdict": "revise", "objections": verdict.blocking,
+             "settled_human_decisions": [{"question": q, "answer": a}
+                                         for q, a in settled.items()]},
+            indent=2)
+        combined_chars = len(combine_diffs(per_repo))
+        fix_timeout = min(
+            cfg.timeout * REVISE_TIMEOUT_MAX_MULTIPLE,
+            int(cfg.timeout * max(1.0, combined_chars / REVISE_TIMEOUT_STEP_CHARS)))
+        fork_this = bool(cfg.fork_session_id and drafter_session is None)
+        fix = drafter(build_verify_fix_prompt(intent_text, objections_json,
+                                              [e["fix_summary"] for e in ledger]),
+                      cfg, drafter_session, "acceptEdits", fork=fork_this,
+                      timeout=fix_timeout)
+        if not fix.ok or not fix.text.strip():
+            record_failure(fix, "verify fixer failed", cfg, report)
+            return EXIT_ERROR
+        accumulate(fix.usage, "claude")
+        fix_summary = fix.text.strip()[:2000]
+        ledger.append({"round": i, "blocking": verdict.blocking,
+                       "fix_summary": fix_summary})
+        if cfg.fork_session_id and fork_this and fix.session_id:
+            report.forked_from_session = cfg.fork_session_id
+            log(f"fixer session forked from interactive conversation "
+                f"{cfg.fork_session_id[:8]}... -> {fix.session_id[:8]}...")
+        drafter_session = fix.session_id
+        log(f"fixer applied changes (summary: {fix_summary[:120]})")
+
+    if last_verdict is None or last_verdict.blocking:
+        report.outcome = "verify-no-consensus"
+        if last_verdict is not None:
+            report.blocking_remaining = last_verdict.blocking
+            report.minor_remaining = last_verdict.minor
+        log(f"VERIFY NO CONSENSUS after {iterations_used} round(s); "
+            "remaining blocking objections are in the report. Fix them "
+            "in-chat and re-run, or accept them explicitly.")
+        return EXIT_VERIFY_NO_CONSENSUS
+
+    # --- commit gate: machine-enforced, branch-guarded, never pushing -------
+    if cfg.dry_run:
+        report.outcome = "verify-clean"
+        log("DRY-RUN: would commit each touched repo (branch-guarded)")
+        return EXIT_CONSENSUS
+    touched = []
+    for r in repos:
+        diff = collect_repo_diff(r, excludes[r])
+        if diff["diff"].strip():
+            touched.append(diff)
+    blocked = [(r["repo"], r["branch"]) for r in touched
+               if r["branch"] in ("main", "master")]
+    if blocked:
+        for t, b in blocked:
+            log(f"commit BLOCKED: {t} is on '{b}'. Create a feature branch and "
+                "re-run; nothing has been staged or committed.")
+        report.outcome = "blocked-on-branch"
+        report.implement_refused = True
+        report.branch_blocked_repos = [str(t) for t, _ in blocked]
+        return EXIT_BLOCKED_ON_BRANCH
+    message = build_commit_message(cfg.plan_path, intent_text, minors_total)
+    commits = []
+    for r in touched:
+        repo = r["repo"]
+        git_run(repo, "add", "-A", "--", *(["."] + excludes[repo]))
+        git_run(repo, "commit", "-m", message)
+        sha = git_run(repo, "rev-parse", "HEAD").stdout.strip()
+        commits.append({"repo": str(repo), "branch": r["branch"], "sha": sha})
+        log(f"committed {repo.name}@{sha[:10]} on '{r['branch']}' "
+            f"({len(r['diff'].splitlines())} diff lines reviewed)")
+    report.commits = commits
+    report.repos_touched = [str(r["repo"]) for r in touched]
+    report.outcome = "verify-clean"
+    log(f"VERIFY CLEAN: {len(commits)} commit(s); push stays yours "
+        "(git push is never automated)")
+    summary = {
+        "outcome": "verify-clean", "strategy": cfg.strategy,
+        "rounds_used": iterations_used, "max_iterations": cfg.max_iterations,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "usage": usage_by_agent, "intent_doc": str(cfg.plan_path),
+        "history_dir": str(cfg.history_dir), "commits": commits,
+    }
+    (cfg.history_dir / "run-summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8")
+    return EXIT_CONSENSUS
+
+
 def load_settled_state(history_dir: Path) -> dict:
     """Decisions settled in earlier rounds of this same plan.
 
@@ -1895,8 +2481,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "The engine refuses to start if the file on disk hashes "
                         "differently - guards against reviewing a stale/wrong-branch "
                         "version (e.g. a worktree that branched from the wrong base)")
-    p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
-                   help=f"max review->revise cycles per invocation (default {DEFAULT_MAX_ITERATIONS})")
+    p.add_argument("--max-iterations", type=int, default=None,
+                   help="max review->revise cycles per invocation (default: "
+                        f"{DEFAULT_MAX_ITERATIONS}, or {DEFAULT_VERIFY_ITERATIONS} "
+                        "with --verify)")
+    p.add_argument("--verify", action="store_true",
+                   help="VERIFY stage: the positional file is the consensus INTENT "
+                        "doc. Diff every linked repo (merge-base with the default "
+                        "branch through the working tree), review the diff against "
+                        "the intent, fix blocking objections headlessly between "
+                        "rounds, and COMMIT each touched repo on a clean review. "
+                        "Refuses main/master; git push is never automated.")
     p.add_argument("--strategy", choices=["fresh", "chained"], default="chained",
                    help="REVIEWER session policy: chained (default - the reviewer "
                         "resumes its own session each round, within a run and "
@@ -1957,6 +2552,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = p.parse_args(argv)
 
     plan_path = Path(args.plan_file).resolve()
+    max_iterations = max(1, args.max_iterations if args.max_iterations is not None
+                         else (DEFAULT_VERIFY_ITERATIONS if args.verify
+                               else DEFAULT_MAX_ITERATIONS))
     if args.preflight:
         pass                       # plan not required for preflight
     elif not plan_path.is_file():
@@ -2004,10 +2602,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.link_repo and args.repo != ".":
             raise OrchestratorError("--link-repo and --repo are mutually exclusive")
+        # Glue absorbed from the plugin command (0.8.0): with no explicit
+        # repo flags, the engine resolves the repo set itself - a saved
+        # project set on membership, else the plan's own repository.
         if args.link_repo:
-            repo = build_workspace([Path(r) for r in args.link_repo])
-            log(f"synthetic workspace (links to: "
-                f"{', '.join(Path(r).name for r in args.link_repo)}): {repo}")
+            remember_project_set([Path(r) for r in args.link_repo], plan_path)
+            repos_resolved: Optional[list[Path]] = [Path(r).resolve()
+                                                    for r in args.link_repo]
+        elif "--repo" in sys.argv:
+            repos_resolved = None          # explicit workspace override, as given
+        else:
+            repos_resolved = resolve_repo_set(plan_path)
+        if repos_resolved is not None:
+            repo = build_workspace(repos_resolved)
+            links = (', '.join(p.name for p in repos_resolved)
+                     or "(nothing - plan is outside any git repository)")
+            log(f"synthetic workspace (links to: {links}): {repo}")
         else:
             repo = Path(args.repo).resolve()
             if not repo.is_dir():
@@ -2025,6 +2635,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not brief_text:
                 raise OrchestratorError(f"--context-brief {brief_path} is empty")
 
+        rules_file = args.review_rules
+        if not rules_file and not args.preflight and plan_path.is_file():
+            rules_root = _git_repo_root(plan_path.parent)
+            if rules_root:
+                candidate = rules_root / "agent-review-rules.md"
+                if candidate.is_file():
+                    rules_file = str(candidate)
+                    log(f"review rules auto-detected: {candidate}")
         try:
             claude_cmd = resolve_claude_cmd(args.claude_cli, args.dry_run)
         except OrchestratorError as e:
@@ -2039,11 +2657,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             repo=repo,
             plan_path=plan_path,
             history_dir=history_dir,
-            max_iterations=max(1, args.max_iterations),
+            max_iterations=max_iterations,
             timeout=args.timeout,
             strategy=args.strategy,
             dry_run=args.dry_run,
-            review_rules=load_review_rules(args.review_rules, args.replace_default_rules),
+            review_rules=load_review_rules(rules_file, args.replace_default_rules),
             brief_text=brief_text,
             decisions_file=args.decisions,
             fork_session_id=fork_session_id,
@@ -2052,6 +2670,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             review_parse_retries=max(0, args.review_parse_retries),
             implement_repos=([Path(r).resolve() for r in args.implement_repo]
                              if args.implement_repo else []),
+            link_repos=repos_resolved or [],
             heartbeat_secs=max(0, args.heartbeat),
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
@@ -2091,7 +2710,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "pass it to guard against stale/wrong-branch reviews)")
                 log(f"plan repo: branch={report.plan_branch} commit={report.plan_commit}")
                 for w in check_plan_repo_consistency(
-                        plan_path, [Path(r) for r in args.link_repo]):
+                        plan_path, repos_resolved or []):
                     report.warnings.append(w)
                     log(f"WARNING: {w}")
             if args.preflight:
@@ -2110,7 +2729,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 log(f"ERROR {report.error}")
                 return EXIT_ERROR
             try:
-                return run_loop(cfg, args.implement, report)
+                return (run_verify(cfg, report) if args.verify
+                        else run_loop(cfg, args.implement, report))
             finally:
                 if plan_lock != "dry-run":
                     Path(plan_lock).unlink(missing_ok=True)
