@@ -1,9 +1,24 @@
 ---
 name: countersign
-description: Consensus-gated implementation. Use when the user asks to implement a change or fix discussed in this chat via countersign (e.g. "implement fix using countersign"). Derives a short intent doc from this conversation, runs the GLM consensus loop on it, implements on a feature branch, then headlessly verifies the diff against the intent and commits. For reviewing a standalone plan document without implementing, use the /countersign command (plan mode) instead.
+description: Consensus-gated implementation and plan review. Use when the user asks to implement a change or fix discussed in this chat via countersign (runs intent-doc consensus, implements on a feature branch, headlessly verifies the diff, commits), or asks for a countersign review of a standalone plan document (plan-consensus mode - GLM reviews, headless Claude revises, no code touched). The mode is chosen by the artifact, not by phrasing - see Route first.
 ---
 
 # countersign - consensus-gated implement + verify + commit
+
+## Route first
+
+Two modes, chosen by the ARTIFACT the user points at, never by magic words:
+
+- **Work to do in code** ("implement", "fix", "add" a discussed change) ->
+  the full pipeline below (Stages 1-4).
+- **A document to judge** ("review this plan", "stress-test this design")
+  -> plan-consensus mode: follow
+  `${CLAUDE_PLUGIN_ROOT}/commands/countersign.md` directly - the same
+  consensus loop runs on that document, no code is touched, nothing is
+  committed.
+- **Ambiguous** ("run countersign on this"): uncommitted changes in a
+  linked repo -> verify mode; a named plan document -> plan mode; neither
+  -> ask the human ONE question rather than guessing.
 
 You (the interactive session) are the DRAFTER OF RECORD: you hold this
 conversation's context. The engine does the looping; you mediate between
