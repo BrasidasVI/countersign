@@ -623,5 +623,72 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("resume commit landed",
           "countersign: verified" in gx(repoA, "log", "-1", "--format=%B").stdout)
 
+    # ------------- fork policy: deterministic fork-vs-fresh decisions --------
+
+    def fake_transcript(home: Path, name: str, sid: str, nonce: str,
+                        pad_lines: list[str]) -> None:
+        proj = (home / ".claude" / "projects"
+                / re.sub(r"[^A-Za-z0-9-]", "-", str(Path.cwd())))
+        proj.mkdir(parents=True, exist_ok=True)
+        body = (json.dumps({"sessionId": sid}) + "\n"
+                + json.dumps({"tool_use": f"countersign --fork-invocation-nonce {nonce}"})
+                + "\n" + "\n".join(pad_lines) + "\n")
+        (proj / name).write_text(body, encoding="utf-8")
+
+    print("scenario F1: small text transcript -> FORK (within indifference margin)")
+    fh1 = T / "fakehome-f1"
+    fake_transcript(fh1, "f1.jsonl", "sess-F1", "cs-f1",
+                    ["x" * 100] * 10)                     # ~1KB, no tool markers
+    planF1 = make_plan(repoA, "plan-f1.md", "# Plan F1\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planF1, [repoA, repoB],
+                              extra=["--fork-invocation-nonce", "cs-f1"],
+                              stub_mode="revise", no_fork=False,
+                              env_extra={"HOME": str(fh1)})
+    check("F1 consensus", rc == 0 and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("F1 decision logged FORK", "FORK" in err, err[-200:])
+    check("F1 report rationale says fork",
+          str(rep.get("fork_decision", "")).startswith("fork:"),
+          str(rep.get("fork_decision")))
+    check("F1 forked the nonce session",
+          rep.get("forked_from_session") == "sess-F1",
+          str(rep.get("forked_from_session")))
+
+    print("scenario F2: tool-output-heavy transcript -> FRESH regardless of size")
+    fh2 = T / "fakehome-f2"
+    fake_transcript(fh2, "f2.jsonl", "sess-F2", "cs-f2",
+                    ['{"tool_result": "' + "x" * 200 + '"}'] * 20)
+    planF2 = make_plan(repoA, "plan-f2.md", "# Plan F2\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planF2, [repoA, repoB],
+                              extra=["--fork-invocation-nonce", "cs-f2"],
+                              stub_mode="revise", no_fork=False,
+                              env_extra={"HOME": str(fh2)})
+    check("F2 consensus", rc == 0 and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("F2 decision logged FRESH", "FRESH" in err, err[-200:])
+    check("F2 rationale names the tool-output hedge",
+          "tool-output-heavy" in str(rep.get("fork_decision")),
+          str(rep.get("fork_decision")))
+    check("F2 ran fresh (no fork recorded)",
+          rep.get("forked_from_session") is None,
+          str(rep.get("forked_from_session")))
+
+    print("scenario F3: oversized transcript, tiny plan -> FRESH (cold read dominates)")
+    fh3 = T / "fakehome-f3"
+    fake_transcript(fh3, "f3.jsonl", "sess-F3", "cs-f3",
+                    ["y" * 8000] * 50)                    # ~400KB of pure text
+    planF3 = make_plan(repoA, "plan-f3.md", "# Plan F3\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planF3, [repoA, repoB],
+                              extra=["--fork-invocation-nonce", "cs-f3"],
+                              stub_mode="revise", no_fork=False,
+                              env_extra={"HOME": str(fh3)})
+    check("F3 consensus", rc == 0 and rep.get("outcome") == "consensus", f"rc={rc}")
+    check("F3 decision logged FRESH", "FRESH" in err, err[-200:])
+    check("F3 rationale cites the cost comparison",
+          "tok" in str(rep.get("fork_decision"))
+          and str(rep.get("fork_decision")).startswith("fresh:"),
+          str(rep.get("fork_decision")))
+    check("F3 ran fresh (no fork recorded)",
+          rep.get("forked_from_session") is None,
+          str(rep.get("forked_from_session")))
+
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
     sys.exit(1 if failures else 0)

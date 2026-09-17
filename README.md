@@ -145,7 +145,11 @@ repos and rules itself):
    identifies exactly which chat triggered it, so re-triggering from the
    same chat reuses its context, and starting a new chat is the one way to
    reset it. (Stale context can therefore only come from staying in an old
-   chat — a user decision, by design.)
+   chat — a user decision, by design.) Whether a fork actually happens is
+   the measured fork policy (0.9.0): the engine estimates the cost of
+   re-sending the transcript versus a fresh reconstruction and picks, with
+   the rationale logged and in the report — a cold oversized or
+   tool-output-heavy transcript goes fresh automatically.
 2. The engine builds a **synthetic workspace** (`~/.countersign/ws/<hash>/`)
    containing links to exactly the repos resolved for this plan's project —
    by default the one repo the plan lives in. The agents see those and
@@ -171,6 +175,12 @@ repos and rules itself):
   zcode spend: each round resumes the reviewer's own session instead of
   re-reading and re-deriving the plan from scratch, including on re-runs
   after decisions or rate limits.
+- The drafter/fixer fork-vs-fresh choice is also automatic (`--fork-policy
+  auto`, 0.9.0): the engine measures the invoking transcript (size,
+  tool-output fraction) against the fresh-session reconstruction and forks
+  only when forking is estimated to be the cheaper path within a 1.5x
+  indifference margin. The decision and its numbers are logged and land in
+  the run report (`fork_decision`).
 - A pre-run cost estimate is logged before the loop starts; per-agent token
   totals are reported in the final summary.
 - Rate/quota hits back off exponentially; a spent window exits

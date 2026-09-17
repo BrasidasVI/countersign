@@ -64,11 +64,13 @@ Usage limits (Claude Pro / z.ai 5h+weekly windows):
     persisted (plan snapshots + sessions in <history>) so a later re-run
     continues rather than re-spending earlier iterations.
   - a pre-run cost estimate is logged; per-agent token totals are reported.
-  - revise calls FORK the interactive conversation by default (the invoking
-    chat identified exactly via --fork-invocation-nonce, falling back to the
-    newest transcript; full context inherited once, then the fork is resumed
-    incrementally) instead of re-sending a reconstructed plan+brief on every
-    call; --no-fork restores fresh revise sessions.
+  - revise/fixer calls fork the invoking conversation or run fresh per the
+    measured --fork-policy (default auto, 0.9.0): the engine compares the
+    cost of re-sending the transcript (cold first read, warm subsequent
+    rounds, tool-output fraction as a context-density proxy) against the
+    reconstruction it would re-send fresh (plan/intent + objections + brief)
+    and picks with a logged rationale; a tool-output-heavy transcript always
+    goes fresh; --fork-session-id forces a fork, --no-fork forces fresh.
   - the reviewer CHAINS by default (--strategy chained): every round resumes
     its own prior session, within a run and across re-runs (decisions /
     rate-limit / interrupted resumes), so earlier rounds' context is kept and
@@ -119,6 +121,16 @@ HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main
 REVISE_SHRINK_REFUSE_RATIO = 0.60
 REVISE_SHRINK_WARN_RATIO = 0.85
 REVISE_FEASIBILITY_WARN_CHARS = 100_000   # ~25k output tokens per revise turn
+
+# Fork policy (0.9.0): deterministic fork-vs-fresh for headless drafter/fixer
+# calls. Forking re-sends the whole invoking transcript as input - the first
+# read at full price (the prompt cache is always cold at invocation start),
+# later rounds at the assumed warm multiplier. Fresh re-sends only the
+# reconstruction (plan/intent + objections + brief) each round.
+FORK_POLICY_TOKENS_PER_CHAR = 0.25
+FORK_POLICY_CACHE_WARM_MULT = 0.1        # cached-input price multiplier (assumed)
+FORK_POLICY_MARGIN = 1.5                 # indifference margin; near-tie favors fork
+FORK_POLICY_TOOL_FRAC_MAX = 0.5          # above this, the transcript is payload, not context
 REVISE_TIMEOUT_STEP_CHARS = 40_000        # one extra --timeout per this many chars
 REVISE_TIMEOUT_MAX_MULTIPLE = 6
 TRUNCATION_RETRY_NOTE = (
@@ -375,6 +387,42 @@ def build_workspace(repo_paths: list[Path]) -> Path:
     return ws
 
 
+def locate_invocation_transcript(cwd: Path, nonce: Optional[str] = None
+                                 ) -> tuple[Optional[str], Optional[Path]]:
+    """(sessionId, transcript path) of the interactive chat that invoked this
+    run - the same lookup discover_current_claude_session performs, but also
+    returning the transcript FILE so the fork policy can measure what
+    forking would actually re-send."""
+    root = Path.home() / ".claude" / "projects"
+    encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd))
+    proj = root / encoded
+    if not proj.is_dir():
+        return None, None
+    transcripts = sorted(proj.glob("*.jsonl"))
+    chosen: Optional[Path] = None
+    if nonce:
+        for t in transcripts:
+            try:
+                text = t.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if nonce in text:
+                chosen = t
+                break
+        if chosen is None:
+            return None, None
+    else:
+        if not transcripts:
+            return None, None
+        chosen = max(transcripts, key=lambda p: p.stat().st_mtime)
+    try:
+        first = chosen.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        sid = json.loads(first).get("sessionId")
+        return (str(sid) if sid else None), chosen
+    except (OSError, IndexError, ValueError):
+        return None, chosen
+
+
 def discover_current_claude_session(cwd: Path,
                                     nonce: Optional[str] = None) -> Optional[str]:
     """Session ID of the interactive Claude Code session that invoked this run.
@@ -391,35 +439,71 @@ def discover_current_claude_session(cwd: Path,
 
     Without a nonce: fall back to the most recently modified transcript
     (best-effort). Returns None when nothing plausible is found."""
-    root = Path.home() / ".claude" / "projects"
-    encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd))
-    proj = root / encoded
-    if not proj.is_dir():
-        return None
-    transcripts = sorted(proj.glob("*.jsonl"))
-    if nonce:
-        for t in transcripts:
-            try:
-                text = t.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if nonce in text:
-                try:
-                    sid = json.loads(text.splitlines()[0]).get("sessionId")
-                    return str(sid) if sid else None
-                except (OSError, IndexError, ValueError):
-                    return None
-        return None
-    try:
-        newest = max(transcripts, key=lambda p: p.stat().st_mtime)
-    except ValueError:
-        return None
-    try:
-        first = newest.read_text(encoding="utf-8", errors="replace").splitlines()[0]
-        sid = json.loads(first).get("sessionId")
-        return str(sid) if sid else None
-    except (OSError, IndexError, ValueError):
-        return None
+    return locate_invocation_transcript(cwd, nonce)[0]
+
+
+# --------------------------------------------------------------------------
+# Fork policy: deterministic fork-vs-fresh for headless drafter/fixer calls
+# --------------------------------------------------------------------------
+
+@dataclass
+class ForkDecision:
+    fork: bool
+    reason: str
+    fork_cost: int = 0     # est. input tokens: cold first read + warm rounds
+    fresh_cost: int = 0    # est. input tokens: reconstruction each round
+
+
+def measure_transcript(path: Path) -> tuple[int, float]:
+    """(bytes, tool-output fraction) in one pass. A line counts as tool
+    output when it carries a tool_result marker: implementation sessions
+    bloat with tool output while design discussions are mostly text, so the
+    fraction is the policy's proxy for how much of a transcript is decision
+    context versus payload."""
+    total = 0
+    tool = 0
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            total += len(line)
+            if '"tool_result"' in line or '"toolUseResult"' in line:
+                tool += len(line)
+    return total, (tool / total if total else 0.0)
+
+
+def decide_fork_vs_fresh(*, policy: str, fork_target: bool, explicit: bool,
+                         transcript: Optional[Path], plan_chars: int,
+                         objections_chars: int, brief_chars: int,
+                         rounds_left: int) -> ForkDecision:
+    """FORK when its estimated input cost beats a fresh session within the
+    indifference margin; FRESH on a clear cost loss or a payload-heavy
+    transcript. Explicit --fork-session-id always forks; --fork-policy
+    fork/fresh force the mode."""
+    R = max(1, int((plan_chars + objections_chars + brief_chars)
+                   * FORK_POLICY_TOKENS_PER_CHAR))
+    fresh_cost = max(1, rounds_left * R)
+    if policy == "fresh" or not fork_target:
+        return ForkDecision(False, "forced fresh" if policy == "fresh"
+                            else "no fork target", 0, fresh_cost)
+    if explicit:
+        return ForkDecision(True, "explicit --fork-session-id", 0, fresh_cost)
+    if transcript is None or not transcript.is_file():
+        return ForkDecision(False, "fork target has no measurable transcript",
+                            0, fresh_cost)
+    total_bytes, tool_frac = measure_transcript(transcript)
+    T = max(1, int(total_bytes * FORK_POLICY_TOKENS_PER_CHAR))
+    fork_cost = T + rounds_left * int(T * FORK_POLICY_CACHE_WARM_MULT)
+    if tool_frac > FORK_POLICY_TOOL_FRAC_MAX:
+        return ForkDecision(
+            False, f"tool-output-heavy transcript ({tool_frac:.0%}) - little "
+            "decision context per token", fork_cost, fresh_cost)
+    if fork_cost <= fresh_cost * FORK_POLICY_MARGIN:
+        return ForkDecision(
+            True, f"fork ~{fork_cost:,} tok vs fresh ~{fresh_cost:,} tok - "
+            "within the indifference margin, fork's context fidelity wins",
+            fork_cost, fresh_cost)
+    return ForkDecision(
+        False, f"fork ~{fork_cost:,} tok vs fresh ~{fresh_cost:,} tok - the "
+        "cold transcript read dominates", fork_cost, fresh_cost)
 
 
 # --------------------------------------------------------------------------
@@ -967,6 +1051,9 @@ class Config:
     review_parse_retries: int = 1
     implement_repos: list = field(default_factory=list)
     link_repos: list = field(default_factory=list)   # resolved real repo paths (verify)
+    fork_policy: str = "auto"              # "auto" | "fork" | "fresh"
+    fork_transcript: Optional[Path] = None  # invoking chat transcript (measurable)
+    fork_explicit: bool = False             # --fork-session-id given: always fork
     heartbeat_secs: int = DEFAULT_HEARTBEAT_SECS
 
 
@@ -1043,6 +1130,7 @@ class RunReport:
     repos_touched: list = field(default_factory=list)
     verify_mode: bool = False
     commits: list = field(default_factory=list)   # [{repo, branch, sha}] on verify-clean
+    fork_decision: str = ""                       # drafter/fixer fork-vs-fresh rationale
     branch_blocked_repos: list = field(default_factory=list)
     agent_models: dict = field(default_factory=dict)
     forked_from_session: Optional[str] = None
@@ -1432,8 +1520,22 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
         # since forks are derived automatically - and the reviewer chains by
         # default too; --strategy fresh makes each round fully independent.
         drafter_chained = cfg.strategy == "chained" or bool(cfg.fork_session_id)
-        fork_this = bool(cfg.fork_session_id and drafter_session is None
-                         and drafter_chained)
+        fork_this = False
+        if (drafter_session is None and drafter_chained
+                and cfg.fork_session_id):
+            # Fork-vs-fresh is decided ONCE, at the first revise call, from
+            # measurable state (0.9.0) - later calls resume whichever session
+            # the first one produced.
+            fd = decide_fork_vs_fresh(
+                policy=cfg.fork_policy, fork_target=True,
+                explicit=cfg.fork_explicit, transcript=cfg.fork_transcript,
+                plan_chars=len(plan_text), objections_chars=len(objections_json),
+                brief_chars=len(cfg.brief_text),
+                rounds_left=max(1, cfg.max_iterations - i))
+            report.fork_decision = ("fork: " if fd.fork else "fresh: ") + fd.reason
+            log(f"fork policy [{cfg.fork_policy}] consensus revise -> "
+                f"{'FORK' if fd.fork else 'FRESH'}: {fd.reason}")
+            fork_this = fd.fork
         use_session = drafter_session if drafter_chained else None
         # Revising means re-emitting the whole document, so give the call room
         # to actually finish: one --timeout's worth per REVISE_TIMEOUT_STEP_CHARS
@@ -2100,7 +2202,18 @@ def run_verify(cfg: Config, report: RunReport) -> int:
         fix_timeout = min(
             cfg.timeout * REVISE_TIMEOUT_MAX_MULTIPLE,
             int(cfg.timeout * max(1.0, combined_chars / REVISE_TIMEOUT_STEP_CHARS)))
-        fork_this = bool(cfg.fork_session_id and drafter_session is None)
+        fork_this = False
+        if drafter_session is None and cfg.fork_session_id:
+            fd = decide_fork_vs_fresh(
+                policy=cfg.fork_policy, fork_target=True,
+                explicit=cfg.fork_explicit, transcript=cfg.fork_transcript,
+                plan_chars=len(intent_text), objections_chars=len(objections_json),
+                brief_chars=0,
+                rounds_left=max(1, cfg.max_iterations - i))
+            report.fork_decision = ("fork: " if fd.fork else "fresh: ") + fd.reason
+            log(f"fork policy [{cfg.fork_policy}] verify fixer -> "
+                f"{'FORK' if fd.fork else 'FRESH'}: {fd.reason}")
+            fork_this = fd.fork
         fix = drafter(build_verify_fix_prompt(intent_text, objections_json,
                                               [e["fix_summary"] for e in ledger]),
                       cfg, drafter_session, "acceptEdits", fork=fork_this,
@@ -2462,13 +2575,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="same as --fork-session-id but auto-detects the current "
                         "interactive session from ~/.claude/projects transcripts "
                         "(this is already the default; kept for compatibility)")
+    p.add_argument("--fork-policy", choices=["auto", "fork", "fresh"], default="auto",
+                   help="context policy for headless drafter/fixer calls (default "
+                        "auto): the engine MEASURES the invoking transcript - its "
+                        "token size, tool-output fraction, a cold first read, "
+                        "rounds remaining - against the reconstruction it would "
+                        "re-send in a fresh session, and forks only when the "
+                        "estimated cost wins within a 1.5x indifference margin "
+                        "(near-ties favor fork for context fidelity; a "
+                        "tool-output-heavy transcript always goes fresh). "
+                        "'fork'/'fresh' force the mode. --no-fork remains an "
+                        "alias for --fork-policy fresh; an explicit "
+                        "--fork-session-id always forks.")
     p.add_argument("--no-fork", action="store_true",
-                   help="run revise calls as fresh sessions working from the context "
-                        "brief (the pre-0.5 default). By default the engine forks "
-                        "the current interactive conversation: full drafting "
-                        "context is inherited once, then the fork is resumed "
-                        "incrementally - cheaper than re-sending a reconstructed "
-                        "plan+brief every round")
+                   help="alias for --fork-policy fresh: run revise/fixer calls "
+                        "as fresh sessions working from the reconstruction "
+                        "(plan/intent + objections + brief) instead of a fork "
+                        "of the invoking conversation")
     p.add_argument("--fork-invocation-nonce", metavar="NONCE",
                    help="unique string embedded in THIS engine command line by the "
                         "invoking session: the engine forks the session whose "
@@ -2579,14 +2702,15 @@ def main(argv: Optional[list[str]] = None) -> int:
               "exclusive (both name the fork target)", file=sys.stderr)
         return EXIT_ERROR
     fork_session_id = args.fork_session_id
+    fork_transcript: Optional[Path] = None
     if not fork_session_id and not args.no_fork:
-        # Forking the interactive conversation is the default (0.5.0): the
-        # revise calls inherit the drafting context that already exists
-        # instead of re-sending a reconstruction of it on every call. With a
-        # nonce the invoking chat is identified exactly; the mtime fallback
-        # is only for nonce-less invocations.
-        fork_session_id = discover_current_claude_session(Path.cwd(),
-                                                          args.fork_invocation_nonce)
+        # Forking the interactive conversation is a candidate by default
+        # (0.5.0); since 0.9.0 whether it actually happens is decided per run
+        # by the measured fork policy, not assumed. With a nonce the invoking
+        # chat is identified exactly; the mtime fallback is only for
+        # nonce-less invocations.
+        fork_session_id, fork_transcript = locate_invocation_transcript(
+            Path.cwd(), args.fork_invocation_nonce)
         if not fork_session_id and args.fork_invocation_nonce:
             log("note: invocation nonce matched no session transcript - using "
                 "the newest transcript in this project directory instead")
@@ -2671,6 +2795,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             implement_repos=([Path(r).resolve() for r in args.implement_repo]
                              if args.implement_repo else []),
             link_repos=repos_resolved or [],
+            fork_policy=("fresh" if args.no_fork else args.fork_policy),
+            fork_transcript=fork_transcript,
+            fork_explicit=bool(args.fork_session_id),
             heartbeat_secs=max(0, args.heartbeat),
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
@@ -2683,7 +2810,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         HEARTBEAT_SECS = cfg.heartbeat_secs
         report = RunReport(
             plan=str(cfg.plan_path), history_dir=str(cfg.history_dir),
-            strategy=cfg.strategy, forked_from_session=fork_session_id)
+            strategy=cfg.strategy)   # forked_from_session set only when the
+                                     # fork policy actually forks
         try:
             # Content fingerprint + git context: prove the engine is reviewing
             # the exact document the invoking session read. (Inside the try so
