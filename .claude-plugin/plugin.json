@@ -1,5 +1,5 @@
 {
   "name": "countersign",
   "description": "Consensus-gated implementation and plan review: the countersign skill derives an intent doc from the chat, implements on a feature branch, verifies the diff headlessly and commits; /countersign runs plan-mode consensus for design-heavy changes. ZCode (GLM) reviews, headless Claude fixes and revises.",
-  "version": "0.9.0"
+  "version": "0.9.1"
 }

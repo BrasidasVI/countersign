@@ -324,6 +324,75 @@ def zcode_api_key() -> Optional[str]:
     return None
 
 
+def zcode_model_desc(session_id: Optional[str]) -> Optional[str]:
+    """Ground-truth model/reasoning-effort for one zcode session.
+
+    Read from the CLI's own rollout record (newest model-io file first) rather
+    than from our config, so what we log is what actually served the request.
+    Returns None when the session's record can't be found (dry-run, fresh
+    machine, or a CLI that changed its rollout shape).
+    """
+    if not session_id:
+        return None
+    try:
+        roll = Path.home() / ".zcode" / "cli" / "rollout"
+        rec = None
+        for f in sorted(roll.glob("model-io-*.jsonl"),
+                        key=lambda q: q.stat().st_mtime, reverse=True):
+            for ln in reversed(f.read_text(encoding="utf-8").splitlines()):
+                try:
+                    cand = json.loads(ln)
+                except ValueError:
+                    continue
+                if cand.get("sessionId") == session_id:
+                    rec = cand
+                    break
+            if rec:
+                break
+        if not rec:
+            return None
+        m = rec.get("model", {}) or {}
+        effort = ((rec.get("request", {}).get("body", {})
+                   .get("output_config", {})) or {}).get("effort")
+        desc = str(m.get("modelId", "?"))
+        if not effort:
+            try:
+                v2 = json.loads((Path.home() / ".zcode" / "v2" / "config.json")
+                                .read_text(encoding="utf-8"))
+                for prov in (v2.get("provider", {}) or {}).values():
+                    ment = (prov.get("models", {}) or {}).get(desc)
+                    if ment:
+                        eff = ((ment.get("reasoning", {}) or {})
+                               .get("defaultVariant"))
+                        if eff:
+                            effort = f"{eff} (model catalog default)"
+                        break
+            except (OSError, ValueError):
+                pass
+        if effort:
+            desc += f" (reasoning effort: {effort})"
+        return desc
+    except OSError:
+        return None
+
+
+def zcode_configured_model() -> Optional[str]:
+    """The model pin the zcode CLI will resolve for reviewer calls
+    (model.main in ~/.zcode/cli/config.json), when one is set. This is the
+    configured intent; zcode_model_desc() is the ground truth after a call."""
+    try:
+        cfg = json.loads((Path.home() / ".zcode" / "cli" / "config.json")
+                         .read_text(encoding="utf-8"))
+        m = cfg.get("model")
+        if isinstance(m, dict) and m.get("main"):
+            return str(m["main"])
+        if isinstance(m, str) and m:   # a plain string is already a valid pin
+            return m
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 # --------------------------------------------------------------------------
 # Synthetic workspace (both repos visible, nothing else granted)
 # --------------------------------------------------------------------------
@@ -1142,6 +1211,22 @@ class RunReport:
     warnings: list = field(default_factory=list)
 
 
+def note_reviewer_model(report: RunReport, session_id: Optional[str]) -> None:
+    """Log and record which model actually served the reviewer's session.
+
+    Called after successful reviewer calls; the rollout lookup re-runs until
+    it succeeds once (a not-yet-flushed record on round 1 shouldn't pin
+    nothing for the whole run) and stays a silent no-op when it never can
+    (dry-run's sentinel sessionId matches no rollout record).
+    """
+    if not session_id or "zcode" in report.agent_models:
+        return
+    desc = zcode_model_desc(session_id)
+    if desc:
+        report.agent_models["zcode"] = f"zcode {desc}"
+        log(f"reviewer model: {desc}")
+
+
 def record_failure(res: AgentResult, what: str, cfg: Config, report: RunReport) -> None:
     if res.rate_limited:
         report.outcome = "rate-limited"
@@ -1425,6 +1510,7 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
             record_failure(review, "reviewer call failed", cfg, report)
             return EXIT_ERROR
         accumulate(review.usage, "zcode")
+        note_reviewer_model(report, review.session_id)
         if cfg.strategy == "chained":
             reviewer_session = review.session_id
         verdict = parse_verdict(review.text)
@@ -2136,6 +2222,7 @@ def run_verify(cfg: Config, report: RunReport) -> int:
         last_verdict = verdict
         for u in zcode_usages:
             accumulate(u, "zcode")
+        note_reviewer_model(report, reviewer_session)
         if not verdict.raw_ok:
             # Same safety property as plan mode, starker stakes here: an
             # unreadable review must never be the basis of a commit.
@@ -2477,46 +2564,10 @@ def preflight(cfg: Config, report: RunReport) -> int:
             if not z.session_id:
                 failures.append("zcode sessionId")
             # Ground truth for model/effort: this probe's own rollout record
-            try:
-                roll = Path.home() / ".zcode" / "cli" / "rollout"
-                rec = None
-                for f in sorted(roll.glob("model-io-*.jsonl"),
-                                key=lambda q: q.stat().st_mtime, reverse=True):
-                    for ln in reversed(f.read_text(encoding="utf-8").splitlines()):
-                        try:
-                            cand = json.loads(ln)
-                        except ValueError:
-                            continue
-                        if cand.get("sessionId") == z.session_id:
-                            rec = cand
-                            break
-                    if rec:
-                        break
-                if rec:
-                    m = rec.get("model", {}) or {}
-                    effort = ((rec.get("request", {}).get("body", {})
-                               .get("output_config", {})) or {}).get("effort")
-                    desc = str(m.get("modelId", "?"))
-                    if not effort:
-                        try:
-                            v2 = json.loads((Path.home() / ".zcode" / "v2" / "config.json")
-                                            .read_text(encoding="utf-8"))
-                            for prov in (v2.get("provider", {}) or {}).values():
-                                ment = (prov.get("models", {}) or {}).get(desc)
-                                if ment:
-                                    eff = ((ment.get("reasoning", {}) or {})
-                                           .get("defaultVariant"))
-                                    if eff:
-                                        effort = f"{eff} (model catalog default)"
-                                    break
-                        except (OSError, ValueError):
-                            pass
-                    if effort:
-                        desc += f" (reasoning effort: {effort})"
-                    report.agent_models["zcode"] = f"zcode {desc}"
-                    log(f"  model in use: {desc}")
-            except OSError:
-                pass
+            desc = zcode_model_desc(z.session_id)
+            if desc:
+                report.agent_models["zcode"] = f"zcode {desc}"
+                log(f"  model in use: {desc}")
         else:
             failures.append("zcode headless prompt")
             log(f"  headless prompt FAILED: {z.stderr[:200]}")
@@ -2802,6 +2853,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
         log(f"reviewer: {' '.join(cfg.zcode_cmd)}")
+        pin = zcode_configured_model()
+        log(f"reviewer model pin (from ~/.zcode/cli/config.json): {pin}" if pin else
+            "reviewer model pin: unset (CLI default; actual model logged "
+            "after the first reviewer call)")
         if not cfg.api_key and not cfg.dry_run:
             log("WARNING: no ZCODE_API_KEY found (env or ~/.zcode/v2/config.json); "
                 "reviewer calls will likely fail.")

@@ -88,6 +88,11 @@ Note `model.main` must be the STRING `"provider/model"`. The API key comes
 from the `ZCODE_API_KEY` environment variable, or auto-loads from the ZCode
 desktop app's config (`~/.zcode/v2/config.json`) if you're logged in there.
 
+The reviewer's model is logged on every run: the configured pin
+(`model.main`) at startup, then after the first reviewer call the actual
+model + reasoning effort as read from the CLI's own rollout record for that
+session — also emitted in the exit report JSON as `agent_models.zcode`.
+
 The engine locates the bundled CLI (`zcode.cjs`) automatically on Windows
 (per-user and machine-wide installs), Linux (`/opt/ZCode`), and macOS
 (`/Applications` and `~/Applications`); a `zcode` found on PATH is only a
