@@ -11,6 +11,8 @@ Behavior is driven by the prompt it receives on stdin (plus CS_STUB_MODE):
   of the plan (a truncated output turn, far under the engine's shrink gate);
   the re-ask (recognized by the TRUNCATED marker the engine appends) gets
   the full revision. CS_STUB_MODE=truncate2 truncates every reply.
+  CS_STUB_MODE=spendlimit fails every call like the real CLI's monthly
+  spend-limit error: JSON on stdout, exit 1, empty stderr.
 - anything else          -> replies "OK".
 Output: claude -p --output-format json shape {"result", "session_id", "usage"}.
 """
@@ -21,6 +23,19 @@ import sys
 from pathlib import Path
 
 prompt = sys.stdin.read()
+if os.environ.get("CS_STUB_MODE") == "spendlimit":
+    # The real claude CLI in -p --output-format json mode writes its errors as
+    # JSON on STDOUT and exits non-zero; stderr stays empty. Reproduce that
+    # exact shape (monthly spend limit) for the engine's error-recovery test.
+    print(json.dumps({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": True,
+        "result": ("You've hit your monthly spend limit · raise it at "
+                   "claude.ai/settings/usage. Your limit resets 1:20am."),
+        "session_id": "stub-claude-err",
+    }))
+    sys.exit(1)
 if "VERIFY FIX" in prompt:
     # verify-stage fixer: touch a file in cwd (proves it ran against the
     # workspace) and reply with the fix summary the next review round must see

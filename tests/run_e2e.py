@@ -36,6 +36,10 @@ Scenarios (sequential, each with its own plan file and fake repos):
                          transcript CONTAINING the nonce, even when a
                          different (newer-mtime) transcript exists in the
                          same project directory
+  R. stdout error JSON  : claude exits non-zero with the error as JSON on
+                         stdout (spend limit; stderr empty) => the message
+                         reaches the report and the outcome is rate-limited,
+                         not "error"/"empty response"
 """
 import hashlib
 import json
@@ -689,6 +693,17 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
     check("F3 ran fresh (no fork recorded)",
           rep.get("forked_from_session") is None,
           str(rep.get("forked_from_session")))
+
+    print("scenario R: claude's stdout-JSON spend-limit error is diagnosed")
+    planR = make_plan(repoA, "plan-r.md", "# Plan R\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planR, [repoA, repoB], stub_mode="spendlimit")
+    check("exit code 2", rc == 2, f"rc={rc}")
+    check("outcome rate-limited (recognized, not generic error)",
+          rep and rep.get("outcome") == "rate-limited", str(rep)[:160])
+    check("error carries claude's stdout JSON text",
+          "monthly spend limit" in str(rep.get("error", "")), str(rep.get("error"))[:200])
+    check("not the old 'empty response' dead end",
+          "empty response" not in str(rep.get("error", "")))
 
     print(failures and f"\n{len(failures)} FAILURE(S): {failures}" or "\nALL SCENARIOS PASS")
     sys.exit(1 if failures else 0)

@@ -781,10 +781,28 @@ def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] 
             # touching the live session. Available since Claude Code 2.1.x.
             cmd += ["--fork-session"]
     proc = _run(cmd, timeout=timeout or cfg.timeout, cwd=cwd, env_extra={}, stdin_text=prompt)
+    # In -p --output-format json mode Claude Code reports its errors as a JSON
+    # object on STDOUT and exits non-zero - stderr stays empty. That is how the
+    # monthly spend-limit failure arrives, so the error text must be recovered
+    # from stdout: both for the log (it used to read "empty response") and for
+    # the rate-limit check, which otherwise never sees a usage limit.
     if proc.returncode != 0:
-        return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
+        err = proc.stderr.strip()
+        if proc.stdout.strip():
+            data = _loads_cli_json(proc.stdout)
+            detail = str((data or {}).get("result")
+                         or (data or {}).get("error") or "").strip()
+            if detail:
+                err = f"{detail}\n{err}".strip()
+        return AgentResult(ok=False, stderr=err[:2000])
     data = _loads_cli_json(proc.stdout)
     if data is not None:
+        if data.get("is_error"):
+            # Exit 0 but the CLI flagged the turn as failed: the result field
+            # carries the error text, never a usable plan/verdict.
+            return AgentResult(ok=False, stderr=str(
+                data.get("result") or data.get("error")
+                or "claude reported an error").strip()[:2000])
         return AgentResult(
             ok=True,
             text=data.get("result", ""),
