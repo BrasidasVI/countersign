@@ -232,8 +232,10 @@ def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
 # The bundled headless CLI requires an explicit model provider in
 # ~/.zcode/cli/config.json before it will answer --prompt (the desktop app's
 # login alone is not enough). These are the documented defaults, verified
-# against ZCode 0.16.5; no secrets live here - the API key still flows via
-# ZCODE_API_KEY, which the engine extracts from the desktop app's config.
+# against ZCode 0.16.5; no secrets live here. Since ZCode 0.16.9 auth comes
+# from a separate `zcode login` (OAuth, shared credentials in ~/.zcode/v2):
+# the CLI ignores ZCODE_API_KEY, and login picks the live account:* provider
+# ids, so a stale model.main here no longer breaks anything - login wins.
 ZCODE_CLI_CONFIG_DEFAULTS = {
     "provider": {
         "zai-coding-plan": {
@@ -246,9 +248,50 @@ ZCODE_CLI_CONFIG_DEFAULTS = {
 
 
 def _is_zcode_cli_config_error(stderr: str) -> bool:
-    """Recognize the bundled CLI's 'config incomplete' startup errors."""
+    """Recognize the bundled CLI's 'config incomplete' startup errors.
+
+    0.16.9 added two more setup-failure shapes: the provider-catalog search
+    failing (its path guess is broken for the Linux /opt layout) and an
+    account-less model registry ("Select a model before continuing" - the
+    headless CLI needs its own `zcode login`).
+    """
     s = stderr or ""
-    return "Model config is missing" in s or "is missing baseURL" in s
+    return ("Model config is missing" in s or "is missing baseURL" in s
+            or "Select a model before continuing" in s
+            or "Built-in Provider Config" in s)
+
+
+def _zcode_provider_env(cfg) -> dict:
+    """Env that pins the CLI's built-in provider catalog to a real file.
+
+    Invoked bare, zcode.cjs resolves that catalog by probing paths relative
+    to its own location; the guess overshoots on the Linux /opt install
+    (five directories up lands at /config/provider/...) and kills the run
+    with "cannot locate CLI ZCode Built-in Provider Config". Handing it the
+    app-shipped file removes the guess. The personal side (login, model
+    selection) is deliberately not overridden - `zcode login` state must
+    keep working, and pointing ZCODE_PERSONAL_PROVIDER_CONFIG_FILE at the
+    wrong file displaces it.
+    """
+    if os.environ.get("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"):
+        return {}
+    for arg in cfg.zcode_cmd:
+        if arg.endswith(".cjs"):
+            candidate = (Path(arg).resolve().parent.parent
+                         / "config" / "provider" / "zcode-builtin.json")
+            if candidate.is_file():
+                return {"ZCODE_BUILTIN_PROVIDER_CONFIG_FILE": str(candidate)}
+            break
+    return {}
+
+
+def _zcode_failure_hint(stderr: str) -> str:
+    """Prepend an actionable hint to the CLI's account/setup failures."""
+    s = stderr or ""
+    if "Select a model before continuing" in s or "Built-in Provider Config" in s:
+        return ("zcode headless CLI has no usable account - run `zcode login` "
+                "once in a terminal (separate from the desktop app's login): " + s)
+    return s
 
 
 def heal_zcode_cli_config() -> Optional[list]:
@@ -742,9 +785,12 @@ def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = No
         cmd += ["--attach", str(attach)]
     if session_id:
         cmd += ["--resume", session_id]
-    proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra={"ZCODE_API_KEY": cfg.api_key or ""})
+    env_extra = _zcode_provider_env(cfg)
+    if cfg.api_key:
+        env_extra["ZCODE_API_KEY"] = cfg.api_key
+    proc = _run(cmd, timeout=cfg.timeout, cwd=cwd, env_extra=env_extra)
     if proc.returncode != 0:
-        return AgentResult(ok=False, stderr=proc.stderr.strip()[:2000])
+        return AgentResult(ok=False, stderr=_zcode_failure_hint(proc.stderr.strip())[:2000])
     data = _loads_cli_json(proc.stdout)
     if data is None:
         return AgentResult(ok=False, stderr="zcode stdout was not JSON: " + proc.stdout[:500])
@@ -2561,8 +2607,10 @@ def preflight(cfg: Config, report: RunReport) -> int:
 
         log("preflight: zcode CLI")
         if not cfg.api_key:
-            failures.append("zcode api key")
-            log("  no ZCODE_API_KEY and none found in ~/.zcode/v2/config.json")
+            # ZCode 0.16.9+ ignores ZCODE_API_KEY; auth comes from `zcode
+            # login`. Informational only - the probe below decides.
+            log("  note: no ZCODE_API_KEY / desktop-app key found; "
+                "relying on `zcode login` state")
         z = safe(call_zcode, "Reply with exactly the word OK and nothing else.",
                  cwd=probe_cwd, cfg=cfg, mode="plan")
         if not z.ok and _is_zcode_cli_config_error(z.stderr):
