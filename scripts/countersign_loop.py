@@ -300,12 +300,15 @@ def _zcode_failure_hint(stderr: str) -> str:
     """Prepend an actionable hint to the CLI's account/setup failures."""
     s = stderr or ""
     if "project_token_login_failed" in s or "[project-access-token]" in s:
-        # The CLI mints its per-turn project token by POSTing the stored
-        # OAuth token to api.z.ai/api/auth/z/login; a stale/revoked shared
-        # login is rejected there ("Z.ai user information is invalid").
-        return ("zcode rejected the stored login (shared Z.AI credentials are "
-                "stale or revoked) - run `zcode login` once in a terminal to "
-                "re-authenticate: " + s)
+        # The CLI mints its per-turn project token by POSTing the stored OAuth
+        # token to api.z.ai/api/auth/z/login. A stale shared login is one cause
+        # (fixed by `zcode login`); the 2026-10-19 rebuild also produced this
+        # with a fresh login when that endpoint rejected the new token
+        # ("Z.ai user information is invalid") - nothing client-side fixes that.
+        return ("zcode's project-token exchange was rejected - run `zcode login` "
+                "once in a terminal first; if a fresh login still leaves this "
+                "error, the rejection is server-side (report to z.ai support "
+                "with the traceId): " + s)
     if "Select a model before continuing" in s:
         return ("zcode headless CLI has no usable account - run `zcode login` "
                 "once in a terminal (separate from the desktop app's login): " + s)
