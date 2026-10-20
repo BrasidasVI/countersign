@@ -262,16 +262,22 @@ def _is_zcode_cli_config_error(stderr: str) -> bool:
 
 
 def _zcode_provider_env(cfg) -> dict:
-    """Env that pins the CLI's built-in provider catalog to a real file.
+    """Env that pins the CLI's provider catalogs to real files.
 
-    Invoked bare, zcode.cjs resolves that catalog by probing paths relative
-    to its own location; the guess overshoots on the Linux /opt install
-    (five directories up lands at /config/provider/...) and kills the run
-    with "cannot locate CLI ZCode Built-in Provider Config". Handing it the
-    app-shipped file removes the guess. The personal side (login, model
-    selection) is deliberately not overridden - `zcode login` state must
-    keep working, and pointing ZCODE_PERSONAL_PROVIDER_CONFIG_FILE at the
-    wrong file displaces it.
+    Invoked bare, zcode.cjs resolves the built-in catalog by probing paths
+    relative to its own location; the guess overshoots on the Linux /opt
+    install (five directories up lands at /config/provider/...) and kills
+    the run with "cannot locate CLI ZCode Built-in Provider Config".
+    Handing it the app-shipped file removes the guess.
+
+    The 2026-10-19 rebuild additionally pairs the two catalogs: its provider
+    registry rejects a builtin pin without a personal one ("...路径必须同时
+    提供" - must be provided together) and, when spawning the CLI itself, it
+    fills ZCODE_PERSONAL_PROVIDER_CONFIG_FILE with
+    <dataBaseDir>/.zcode/v2/provider_config.json. Mirror that same default
+    (only when the file exists) so nothing `zcode login` wrote is displaced;
+    on a machine without it we stay builtin-only and the CLI fills the same
+    default in.
     """
     if os.environ.get("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"):
         return {}
@@ -280,7 +286,12 @@ def _zcode_provider_env(cfg) -> dict:
             candidate = (Path(arg).resolve().parent.parent
                          / "config" / "provider" / "zcode-builtin.json")
             if candidate.is_file():
-                return {"ZCODE_BUILTIN_PROVIDER_CONFIG_FILE": str(candidate)}
+                env = {"ZCODE_BUILTIN_PROVIDER_CONFIG_FILE": str(candidate)}
+                data_base = os.environ.get("ZCODE_DATA_BASE_DIR") or str(Path.home())
+                personal = Path(data_base) / ".zcode" / "v2" / "provider_config.json"
+                if personal.is_file():
+                    env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = str(personal)
+                return env
             break
     return {}
 
@@ -288,9 +299,20 @@ def _zcode_provider_env(cfg) -> dict:
 def _zcode_failure_hint(stderr: str) -> str:
     """Prepend an actionable hint to the CLI's account/setup failures."""
     s = stderr or ""
-    if "Select a model before continuing" in s or "Built-in Provider Config" in s:
+    if "project_token_login_failed" in s or "[project-access-token]" in s:
+        # The CLI mints its per-turn project token by POSTing the stored
+        # OAuth token to api.z.ai/api/auth/z/login; a stale/revoked shared
+        # login is rejected there ("Z.ai user information is invalid").
+        return ("zcode rejected the stored login (shared Z.AI credentials are "
+                "stale or revoked) - run `zcode login` once in a terminal to "
+                "re-authenticate: " + s)
+    if "Select a model before continuing" in s:
         return ("zcode headless CLI has no usable account - run `zcode login` "
                 "once in a terminal (separate from the desktop app's login): " + s)
+    if "Built-in Provider Config" in s:
+        return ("zcode cannot locate its built-in provider catalog (the CLI's "
+                "path probe misses this install layout) - pass --zcode-cli "
+                "<path to zcode.cjs> or set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: " + s)
     return s
 
 
