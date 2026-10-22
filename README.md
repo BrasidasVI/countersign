@@ -17,6 +17,13 @@ reviewer. Two entry points:
   until the reviewer approves with zero outstanding objections. For
   design-heavy changes: architecture, data models, API contracts, security
   boundaries, migrations.
+- **delegate skill — spend GLM's tokens, keep Claude's judgment.** Hand a
+  well-specified implementation task (a plan section, tests from a spec,
+  mechanical refactors, boilerplate) to GLM through the headless ZCode CLI
+  (see [Delegate](#delegate)). GLM works in an isolated worktree; you
+  review the diff and only then apply it. Since 0.10.0 the countersign
+  implement step itself can be delegated: `--implementer glm` has GLM
+  implement and Claude review (the reverse of the default).
 
 ```
 skill flow (default):
@@ -194,6 +201,64 @@ repos and rules itself):
   re-spending the earlier ones.
 - `--implement` is the budget-dominating pass; it is opt-in for that reason.
 
+## Delegate
+
+The `delegate` skill (`skills/delegate/SKILL.md`, backed by
+`scripts/delegate.py`) hands one well-specified task to GLM through the
+headless ZCode CLI, so the output tokens are spent on the z.ai coding plan
+instead of the Anthropic plan. The session writes a brief (goal, read
+first, numbered steps, do-not, checks, exact final reply) and MUST review
+the result — GLM's own report is never verification.
+
+```
+python3 scripts/delegate.py run --brief brief.md [--repo <path>]...
+                                        # GLM implements in an isolated
+                                        # worktree (branch glm/<run-id>)
+             status|resume <run-id>     # persisted state / continue the
+                                        # same GLM session after a limit
+             apply <run-id>             # land the diff UNCOMMITTED
+             clean <run-id>             # remove worktree + branch
+```
+
+Properties, in brief:
+
+- **Isolation.** Every run edits a dedicated git worktree per `--repo`;
+  the caller's tree is untouched until `apply` (which refuses overlapping
+  uncommitted changes), and nothing is ever committed or pushed by the
+  runner.
+- **Rules, told and enforced (best-effort).** A fixed preamble forbids
+  history/branch operations, edits outside the worktree and reading
+  secrets; a `git` shim first on GLM's PATH refuses `commit`, `push`,
+  `stash`, `rebase`, `merge`, branch switches and friends outright. An
+  absolute-path git call bypasses the shim — the report flags committed
+  work as `glm_committed` and the diff still covers it.
+- **Model and effort.** The headless CLI has no model/effort flag; the
+  runner sets the model pin and the reasoning effort (default `high`,
+  validated against the provider catalog) in the shared ZCode config
+  files under `~/.countersign/zcode-config.lock`, and restores the exact
+  originals on every exit path (a key another writer changed mid-run is
+  left alone with a loud warning). `model_served` in the report is the
+  ground truth read back from the CLI's own rollout record.
+- **Quota-aware.** A pre-check on the z.ai usage monitor (key from
+  `ZAI_API_KEY` or `delegate.zai_key_file`; never logged) refuses to start
+  when the 5-hour window is at/over 60% used or the weekly window at/over
+  90% (configurable via `delegate.max_start_share`), carrying both reset
+  times. A limit hit mid-run stops with outcome `rate-limited` plus the
+  session id (`--on-limit wait` instead sleeps to the real reset time and
+  continues). Both windows' shares are recorded before and after the run.
+- **One JSON line.** Every subcommand prints exactly one JSON line:
+  outcome, per-repo file list (new files as `status: "A"`), GLM's reply,
+  check results, `model_served`, quota, usage (the CLI's own token counts,
+  when it reports them) and warnings.
+
+Since 0.10.0 the engine can also delegate its implement step: with
+`--implement --implementer glm` GLM implements in the delegate worktree
+and a headless Claude reviews the worktree diff (same verdict schema and
+commit gate; blocking objections go back to the GLM session, and on a
+clean review the engine applies, commits with the `countersign: verified`
+trailer and cleans up). `--verify-reviewer` picks the verify reviewer
+explicitly; the default is the model that did not implement.
+
 ## Multiple projects on one device
 
 Repo sets are per project, never per device. Resolution order:
@@ -248,6 +313,10 @@ example.
 | `skills/countersign/SKILL.md` | The countersign skill: intent doc -> consensus -> implement -> verify -> commit. The default entry point, model-triggered. |
 | `commands/countersign.md` | The `/countersign` command: plan-consensus mode. Instructions the interactive session follows. |
 | `scripts/countersign_loop.py` | The engine: agent invocation, verdict parsing, retries/rate limits, verify + commit gate. Full design doc in its docstring. |
+| `scripts/zcode_common.py` | Shared ZCode-CLI helper layer (resolver, provider env, healing, model/effort descriptors, rate-limit markers, heartbeat-wrapped subprocess run, JSON/usage extraction) used by the engine and the delegate runner. |
+| `scripts/delegate.py` | The delegate runner: one GLM task per isolated worktree, git shim, model/effort under lock, z.ai quota pre-check, one JSON line. |
+| `skills/delegate/SKILL.md` | The delegate skill: brief template, running the runner, the mandatory review, apply/clean. |
+| `tests/run_delegate_e2e.py` | Delegate runner e2e test with a stub ZCode (zero model spend): `python3 tests/run_delegate_e2e.py` |
 | `tests/run_e2e.py` | End-to-end engine test with stub agents (zero model spend): `python3 tests/run_e2e.py` |
 
 ## Migrating from the terminal launcher (v0.1)

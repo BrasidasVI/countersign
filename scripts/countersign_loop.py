@@ -90,7 +90,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -109,8 +108,36 @@ DEFAULT_VERIFY_ITERATIONS = 3
 VERIFY_DIFF_ATTACH_CAP_CHARS = 120_000   # above this, the diff is reviewed per file
 COMMIT_TRAILER = "countersign: verified"
 DEFAULT_TIMEOUT_SECS = 900
-DEFAULT_HEARTBEAT_SECS = 30
-HEARTBEAT_SECS = DEFAULT_HEARTBEAT_SECS   # set per-run from --heartbeat in main()
+
+# The ZCode-CLI helper layer (resolver, provider env, healing, model/effort
+# descriptors, rate-limit markers, heartbeat-wrapped _run, JSON/usage
+# extraction) moved unchanged into zcode_common.py (delegate plan, section 1);
+# re-exported here so today's tests and callers keep working.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from zcode_common import (  # noqa: E402
+    DEFAULT_HEARTBEAT_SECS,
+    HEARTBEAT_SECS,
+    OrchestratorError,
+    RATE_LIMIT_MARKERS,
+    ZCODE_CLI_CONFIG_DEFAULTS,
+    _loads_cli_json,
+    _looks_rate_limited,
+    _node_prefix,
+    _preview_cmd,
+    _run,
+    _zcode_explicit_cmd,
+    _zcode_failure_hint,
+    _zcode_provider_env,
+    extract_json_object,
+    heal_zcode_cli_config,
+    log,
+    resolve_zcode_cmd,
+    set_heartbeat_secs,
+    zcode_api_key,
+    zcode_configured_model,
+    zcode_model_desc,
+    zcode_usage_entry,
+)
 
 # A revise pass must re-emit the COMPLETE document (the prompt says so); the
 # protocol never licenses removal. Live runs on a ~158KB plan showed the
@@ -141,70 +168,9 @@ TRUNCATION_RETRY_NOTE = (
     "instead of silently cutting it.")
 
 
-class OrchestratorError(RuntimeError):
-    pass
-
-
 # --------------------------------------------------------------------------
 # CLI / credential resolution
 # --------------------------------------------------------------------------
-
-def resolve_zcode_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
-    """Return the command prefix that launches the ZCode CLI, e.g. [node, zcode.cjs].
-
-    The headless CLI bundled with the ZCode desktop app is preferred on every
-    OS; a `zcode` on PATH is only a last resort (on Linux that is usually the
-    Electron desktop binary, which does not serve headless prompts - it spews
-    startup logs onto stdout and never emits the JSON reply).
-    """
-    if explicit:
-        return _zcode_explicit_cmd(explicit)
-    here = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
-    candidates = [
-        # Windows per-user install (electron-builder default)
-        Path(here) / "Programs" / "ZCode" / "resources" / "glm" / "zcode.cjs",
-        # Windows machine-wide install
-        Path(program_files) / "ZCode" / "resources" / "glm" / "zcode.cjs",
-        # Linux installer (/opt is where the official package puts the app)
-        Path("/opt/ZCode/resources/glm/zcode.cjs"),
-        # macOS system-wide and per-user installs (Electron convention)
-        Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
-        Path.home() / "Applications" / "ZCode.app" / "Contents" / "Resources" / "glm" / "zcode.cjs",
-        # Portable / manual placements
-        Path.home() / ".zcode" / "cli" / "zcode.cjs",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return _node_prefix(str(c))
-    if shutil.which("zcode"):
-        return ["zcode"]
-    if dry_run:
-        return ["node", "<path-to-zcode.cjs>"]
-    raise OrchestratorError(
-        "Could not locate the ZCode CLI. Prerequisite missing? Install the ZCode "
-        "desktop app from https://z.ai and log in once (its bundled CLI is what we "
-        "invoke), or pass --zcode-cli <path to zcode.cjs> "
-        f"(also looked in: {', '.join(str(c) for c in candidates)})."
-    )
-
-
-def _node_prefix(cjs_path: str) -> list[str]:
-    node = shutil.which("node")
-    if not node:
-        raise OrchestratorError("node is required to run zcode.cjs but was not found on PATH.")
-    return [node, cjs_path]
-
-
-def _zcode_explicit_cmd(explicit: str) -> list[str]:
-    # A .cjs bundle needs node; a .py needs this interpreter (keeps stub-agent
-    # testing free of cmd.exe wrapper quoting); anything else runs as-is.
-    if explicit.lower().endswith(".cjs"):
-        return _node_prefix(explicit)
-    if explicit.lower().endswith(".py"):
-        return [sys.executable, explicit]
-    return [explicit]
-
 
 def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     if explicit:
@@ -229,236 +195,17 @@ def resolve_claude_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     )
 
 
-# The bundled headless CLI requires an explicit model provider in
-# ~/.zcode/cli/config.json before it will answer --prompt (the desktop app's
-# login alone is not enough). These are the documented defaults, verified
-# against ZCode 0.16.5; no secrets live here. Since ZCode 0.16.9 auth comes
-# from a separate `zcode login` (OAuth, shared credentials in ~/.zcode/v2):
-# the CLI ignores ZCODE_API_KEY, and login picks the live account:* provider
-# ids, so a stale model.main here no longer breaks anything - login wins.
-ZCODE_CLI_CONFIG_DEFAULTS = {
-    "provider": {
-        "zai-coding-plan": {
-            "kind": "anthropic",
-            "options": {"baseURL": "https://api.z.ai/api/anthropic"},
-        }
-    },
-    "model": {"main": "zai-coding-plan/GLM-5.3"},
-}
-
-
+# The bundled headless CLI's startup failures that preflight can heal or hint
+# (see zcode_common for the provider/env layer). 0.16.9 added two more
+# setup-failure shapes: the provider-catalog search failing (its path guess is
+# broken for the Linux /opt layout) and an account-less model registry
+# ("Select a model before continuing" - the headless CLI needs its own
+# `zcode login`).
 def _is_zcode_cli_config_error(stderr: str) -> bool:
-    """Recognize the bundled CLI's 'config incomplete' startup errors.
-
-    0.16.9 added two more setup-failure shapes: the provider-catalog search
-    failing (its path guess is broken for the Linux /opt layout) and an
-    account-less model registry ("Select a model before continuing" - the
-    headless CLI needs its own `zcode login`).
-    """
     s = stderr or ""
     return ("Model config is missing" in s or "is missing baseURL" in s
             or "Select a model before continuing" in s
             or "Built-in Provider Config" in s)
-
-
-def _zcode_provider_env(cfg) -> dict:
-    """Env that pins the CLI's provider catalogs to real files.
-
-    Invoked bare, zcode.cjs resolves the built-in catalog by probing paths
-    relative to its own location; the guess overshoots on the Linux /opt
-    install (five directories up lands at /config/provider/...) and kills
-    the run with "cannot locate CLI ZCode Built-in Provider Config".
-    Handing it the app-shipped file removes the guess.
-
-    The 2026-10-19 rebuild additionally pairs the two catalogs: its provider
-    registry rejects a builtin pin without a personal one ("...路径必须同时
-    提供" - must be provided together) and, when spawning the CLI itself, it
-    fills ZCODE_PERSONAL_PROVIDER_CONFIG_FILE with
-    <dataBaseDir>/.zcode/v2/provider_config.json. Mirror that same default
-    (only when the file exists) so nothing `zcode login` wrote is displaced;
-    on a machine without it we stay builtin-only and the CLI fills the same
-    default in.
-    """
-    if os.environ.get("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"):
-        return {}
-    for arg in cfg.zcode_cmd:
-        if arg.endswith(".cjs"):
-            candidate = (Path(arg).resolve().parent.parent
-                         / "config" / "provider" / "zcode-builtin.json")
-            if candidate.is_file():
-                env = {"ZCODE_BUILTIN_PROVIDER_CONFIG_FILE": str(candidate)}
-                data_base = os.environ.get("ZCODE_DATA_BASE_DIR") or str(Path.home())
-                personal = Path(data_base) / ".zcode" / "v2" / "provider_config.json"
-                if personal.is_file():
-                    env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = str(personal)
-                return env
-            break
-    return {}
-
-
-def _zcode_failure_hint(stderr: str) -> str:
-    """Prepend an actionable hint to the CLI's account/setup failures."""
-    s = stderr or ""
-    if "project_token_login_failed" in s or "[project-access-token]" in s:
-        # The CLI mints its per-turn project token by POSTing the stored OAuth
-        # token to api.z.ai/api/auth/z/login. A stale shared login is one cause
-        # (fixed by `zcode login`); the 2026-10-19 rebuild also produced this
-        # with a fresh login when that endpoint rejected the new token
-        # ("Z.ai user information is invalid") - nothing client-side fixes that.
-        return ("zcode's project-token exchange was rejected - run `zcode login` "
-                "once in a terminal first; if a fresh login still leaves this "
-                "error, the rejection is server-side (report to z.ai support "
-                "with the traceId): " + s)
-    if "Select a model before continuing" in s:
-        return ("zcode headless CLI has no usable account - run `zcode login` "
-                "once in a terminal (separate from the desktop app's login): " + s)
-    if "Built-in Provider Config" in s:
-        return ("zcode cannot locate its built-in provider catalog (the CLI's "
-                "path probe misses this install layout) - pass --zcode-cli "
-                "<path to zcode.cjs> or set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: " + s)
-    return s
-
-
-def heal_zcode_cli_config() -> Optional[list]:
-    """Merge the documented model/provider defaults into ~/.zcode/cli/config.json.
-
-    Never overwrites existing values and never writes secrets. Returns the
-    list of keys added ([] when nothing was missing), or None when the file
-    could not be read or has an unexpected shape (in which case it is left
-    untouched for the human to fix).
-    """
-    path = Path.home() / ".zcode" / "cli" / "config.json"
-    try:
-        cfg = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        if not isinstance(cfg, dict):
-            return None
-        added = []
-        model = cfg.get("model")
-        if model is None:
-            cfg["model"] = {"main": ZCODE_CLI_CONFIG_DEFAULTS["model"]["main"]}
-            added.append("model.main")
-        elif isinstance(model, dict) and not model.get("main"):
-            model["main"] = ZCODE_CLI_CONFIG_DEFAULTS["model"]["main"]
-            added.append("model.main")
-        # a plain-string model ("provider/model") is already a valid pin; keep it
-        defaults_entry = ZCODE_CLI_CONFIG_DEFAULTS["provider"]["zai-coding-plan"]
-        provider = cfg.get("provider")
-        if provider is None:
-            provider = cfg["provider"] = {}
-        if isinstance(provider, dict):
-            entry = provider.get("zai-coding-plan")
-            if entry is None:
-                entry = provider["zai-coding-plan"] = {}
-            if isinstance(entry, dict):
-                if not entry.get("kind"):
-                    entry["kind"] = defaults_entry["kind"]
-                    added.append("provider.zai-coding-plan.kind")
-                opts = entry.get("options")
-                if opts is None:
-                    opts = entry["options"] = {}
-                if isinstance(opts, dict) and not opts.get("baseURL"):
-                    opts["baseURL"] = defaults_entry["options"]["baseURL"]
-                    added.append("provider.zai-coding-plan.options.baseURL")
-        if added:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-        return added
-    except (OSError, ValueError):
-        return None
-
-
-def zcode_api_key() -> Optional[str]:
-    """ZCODE_API_KEY env var wins; otherwise reuse the desktop app's provider key.
-
-    The key is never written to logs, stdout, or files by this script.
-    """
-    env_key = os.environ.get("ZCODE_API_KEY")
-    if env_key:
-        return env_key
-    v2 = Path.home() / ".zcode" / "v2" / "config.json"
-    try:
-        cfg = json.loads(v2.read_text(encoding="utf-8"))
-        providers = cfg.get("provider", {})
-        for pid in ("builtin:zai-coding-plan", "builtin:bigmodel-coding-plan"):
-            key = (providers.get(pid, {}).get("options", {}) or {}).get("apiKey")
-            if key:
-                return key
-        for p in providers.values():  # fallback: first provider that has a key
-            key = (p.get("options", {}) or {}).get("apiKey")
-            if key:
-                return key
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def zcode_model_desc(session_id: Optional[str]) -> Optional[str]:
-    """Ground-truth model/reasoning-effort for one zcode session.
-
-    Read from the CLI's own rollout record (newest model-io file first) rather
-    than from our config, so what we log is what actually served the request.
-    Returns None when the session's record can't be found (dry-run, fresh
-    machine, or a CLI that changed its rollout shape).
-    """
-    if not session_id:
-        return None
-    try:
-        roll = Path.home() / ".zcode" / "cli" / "rollout"
-        rec = None
-        for f in sorted(roll.glob("model-io-*.jsonl"),
-                        key=lambda q: q.stat().st_mtime, reverse=True):
-            for ln in reversed(f.read_text(encoding="utf-8").splitlines()):
-                try:
-                    cand = json.loads(ln)
-                except ValueError:
-                    continue
-                if cand.get("sessionId") == session_id:
-                    rec = cand
-                    break
-            if rec:
-                break
-        if not rec:
-            return None
-        m = rec.get("model", {}) or {}
-        effort = ((rec.get("request", {}).get("body", {})
-                   .get("output_config", {})) or {}).get("effort")
-        desc = str(m.get("modelId", "?"))
-        if not effort:
-            try:
-                v2 = json.loads((Path.home() / ".zcode" / "v2" / "config.json")
-                                .read_text(encoding="utf-8"))
-                for prov in (v2.get("provider", {}) or {}).values():
-                    ment = (prov.get("models", {}) or {}).get(desc)
-                    if ment:
-                        eff = ((ment.get("reasoning", {}) or {})
-                               .get("defaultVariant"))
-                        if eff:
-                            effort = f"{eff} (model catalog default)"
-                        break
-            except (OSError, ValueError):
-                pass
-        if effort:
-            desc += f" (reasoning effort: {effort})"
-        return desc
-    except OSError:
-        return None
-
-
-def zcode_configured_model() -> Optional[str]:
-    """The model pin the zcode CLI will resolve for reviewer calls
-    (model.main in ~/.zcode/cli/config.json), when one is set. This is the
-    configured intent; zcode_model_desc() is the ground truth after a call."""
-    try:
-        cfg = json.loads((Path.home() / ".zcode" / "cli" / "config.json")
-                         .read_text(encoding="utf-8"))
-        m = cfg.get("model")
-        if isinstance(m, dict) and m.get("main"):
-            return str(m["main"])
-        if isinstance(m, str) and m:   # a plain string is already a valid pin
-            return m
-    except (OSError, ValueError):
-        pass
-    return None
 
 
 # --------------------------------------------------------------------------
@@ -690,28 +437,7 @@ class AgentResult:
     usage: dict = field(default_factory=dict)
     stderr: str = ""
     rate_limited: bool = False
-
-
-# Quota/rate-limit detection markers. The provider-side strings come from the
-# ZCode bundle's own error taxonomy (insufficient_quota, credit_balance_exhausted,
-# exceeded_current_quota_error, organization_usage_limit_exceeded, ...) plus the
-# usual HTTP/Anthropic/OpenAI phrasings; "resets at" catches Claude Code's
-# "usage limit ... resets at 7pm" subscription-window message.
-RATE_LIMIT_MARKERS = (
-    "rate limit", "rate_limit", "rate_limited", "ratelimit", "too many requests",
-    "insufficient_quota", "credit_balance_exhausted", "exceeded_current_quota_error",
-    "organization_usage_limit_exceeded", "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded", "quota", "usage limit", "usage_limit",
-    "limit reached", "limit exceeded", "spend limit", "billing hard limit",
-    "resets at",
-)
-
-
-def _looks_rate_limited(stderr_text: str) -> bool:
-    blob = (stderr_text or "").lower()
-    if re.search(r"\b429\b", blob):   # word-bounded: avoids matching inside token counts
-        return True
-    return any(m in blob for m in RATE_LIMIT_MARKERS)
+    model: Optional[str] = None   # the model the CLI reported for the call
 
 
 def _invoke_with_retries(fn, *, cfg, label: str) -> AgentResult:
@@ -740,64 +466,12 @@ def _invoke_with_retries(fn, *, cfg, label: str) -> AgentResult:
         attempt += 1
 
 
-def _run(cmd: list[str], *, timeout: int, cwd: Path, env_extra: dict, stdin_text: str = "") -> subprocess.CompletedProcess:
-    env = os.environ.copy()
-    env.update(env_extra)
-    # Heartbeat: a long model call (reviews, revise passes, implement passes) can
-    # run for minutes with the parent silent; periodic progress lines make a live
-    # run distinguishable from a hung one.
-    label = _preview_cmd(cmd)
-    beat_secs = max(5, HEARTBEAT_SECS)
-    _stop = threading.Event()
-
-    def _beat() -> None:
-        n = 0
-        while not _stop.wait(beat_secs):
-            n += 1
-            log(f"... in flight: {label} ({n * beat_secs}s elapsed)")
-
-    _beater = threading.Thread(target=_beat, daemon=True)
-    _beater.start()
-    try:
-        return subprocess.run(
-            cmd,
-            input=stdin_text,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            cwd=str(cwd),
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        raise OrchestratorError(f"Command timed out after {timeout}s: {label}")
-    except OSError as e:
-        raise OrchestratorError(f"Failed to launch {label}: {e}")
-    finally:
-        _stop.set()
-        _beater.join(timeout=1)
-
-
 def call_zcode(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = None,
                session_id: Optional[str] = None, mode: str = "plan") -> AgentResult:
     return _invoke_with_retries(
         lambda: _call_zcode_once(prompt, cwd=cwd, cfg=cfg, attach=attach,
                                  session_id=session_id, mode=mode),
         cfg=cfg, label="zcode")
-
-
-def _loads_cli_json(text: str) -> Optional[dict]:
-    """Parse CLI stdout that should be one JSON object; tolerate stray lines.
-
-    Strict parse first; fall back to brace-slicing so a stray log line on
-    stdout (e.g. an Electron app's startup logging) cannot kill an otherwise
-    good agent reply.
-    """
-    try:
-        return json.loads(text)
-    except ValueError:
-        return extract_json_object(text)
 
 
 def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = None,
@@ -823,7 +497,7 @@ def _call_zcode_once(prompt: str, *, cwd: Path, cfg, attach: Optional[Path] = No
         ok=True,
         text=data.get("response", ""),
         session_id=data.get("sessionId"),
-        usage=data.get("usage", {}),
+        usage=zcode_usage_entry(data),
     )
 
 
@@ -879,6 +553,7 @@ def _call_claude_once(prompt: str, *, cwd: Path, cfg, session_id: Optional[str] 
             text=data.get("result", ""),
             session_id=data.get("session_id"),
             usage=data.get("usage", {}) or {},
+            model=(str(data["model"]) if data.get("model") else None),
         )
     # Non-JSON stdout: treat the whole stdout as the result text.
     return AgentResult(ok=True, text=proc.stdout.strip())
@@ -1021,36 +696,6 @@ def build_implement_prompt(plan_path: Path, target_repo: Path,
         "record the decision in IMPLEMENTATION-NOTES.md. Run the tests the plan "
         "specifies if the environment allows it." + scope
     )
-
-
-def extract_json_object(text: str) -> Optional[dict]:
-    """Parse a model reply that should be a single JSON object; tolerate fences."""
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        v = json.loads(text)
-        if isinstance(v, dict):
-            return v
-    except ValueError:
-        pass
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced:
-        try:
-            v = json.loads(fenced.group(1))
-            if isinstance(v, dict):
-                return v
-        except ValueError:
-            pass
-    start, end = text.find("{"), text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            v = json.loads(text[start:end + 1])
-            if isinstance(v, dict):
-                return v
-        except ValueError:
-            pass
-    return None
 
 
 @dataclass
@@ -1213,13 +858,9 @@ class Config:
     fork_transcript: Optional[Path] = None  # invoking chat transcript (measurable)
     fork_explicit: bool = False             # --fork-session-id given: always fork
     heartbeat_secs: int = DEFAULT_HEARTBEAT_SECS
-
-
-def log(msg: str) -> None:
-    # Logs go to stderr so stdout stays reserved for the one-line JSON summary
-    # emitted on exit (see Output contract in the module docstring).
-    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{stamp}] {msg}", file=sys.stderr, flush=True)
+    implementer: str = "claude"             # "claude" | "glm" (section 5)
+    verify_reviewer: str = "glm"            # "glm" | "claude"; default: not the implementer
+    checks: list = field(default_factory=list)   # --check "<repo>:<cmd>|<cmd>"
 
 
 def snapshot(path: Path, dest_dir: Path, name: str) -> None:
@@ -1298,6 +939,7 @@ class RunReport:
     plan_branch: Optional[str] = None
     plan_commit: Optional[str] = None
     warnings: list = field(default_factory=list)
+    delegate_run_id: Optional[str] = None   # --implementer glm: the delegate run
 
 
 def note_reviewer_model(report: RunReport, session_id: Optional[str]) -> None:
@@ -1837,25 +1479,38 @@ def run_loop(cfg: Config, implement: bool, report: RunReport) -> int:
                 report.implement_refused = True
                 report.branch_blocked_repos = [str(t) for t, _ in blocked]
                 return EXIT_BLOCKED_ON_BRANCH
-            for target_repo in targets:
-                branch = _git_branch(target_repo)
-                if branch is None:
-                    log(f"note: {target_repo} is not a git repo (or git unavailable); "
-                        "branch guard skipped")
-                log(f"implement pass: claude is editing {target_repo} on branch "
-                    f"'{branch}' (acceptEdits, changes stay UNCOMMITTED)")
+            if cfg.implementer == "glm":
+                # Section 5: GLM implements in delegate worktrees; the usage
+                # pre-check and --on-limit return apply inside the runner.
+                log("implement pass: GLM (zcode) is implementing in delegate "
+                    "worktrees; the caller's tree stays untouched until "
+                    "verify applies the diff")
                 report.implement_attempted = True
-                impl = call_claude(build_implement_prompt(cfg.plan_path, target_repo, targets),
-                                   cwd=target_repo, cfg=cfg,
-                                   session_id=None, permission_mode="acceptEdits")
-                accumulate(impl.usage, "claude")
-                if not impl.ok:
-                    record_failure(impl, f"implement pass failed for {target_repo}", cfg, report)
+                how = delegate_implement(cfg, report, targets)
+                if how != "ok":
                     return EXIT_ERROR
-                log(f"implement pass finished for {target_repo} "
-                    f"({len(impl.text)} chars of commentary); review with git diff and commit yourself")
-            log("git steps are intentionally NOT automated; per repo:")
-            log('  git add -A && git commit -m "implement plan (dual-agent consensus)"')
+                log("delegate implement finished; review happens in the "
+                    "verify stage (--verify --implementer glm)")
+            else:
+                for target_repo in targets:
+                    branch = _git_branch(target_repo)
+                    if branch is None:
+                        log(f"note: {target_repo} is not a git repo (or git unavailable); "
+                            "branch guard skipped")
+                    log(f"implement pass: claude is editing {target_repo} on branch "
+                        f"'{branch}' (acceptEdits, changes stay UNCOMMITTED)")
+                    report.implement_attempted = True
+                    impl = call_claude(build_implement_prompt(cfg.plan_path, target_repo, targets),
+                                       cwd=target_repo, cfg=cfg,
+                                       session_id=None, permission_mode="acceptEdits")
+                    accumulate(impl.usage, "claude")
+                    if not impl.ok:
+                        record_failure(impl, f"implement pass failed for {target_repo}", cfg, report)
+                        return EXIT_ERROR
+                    log(f"implement pass finished for {target_repo} "
+                        f"({len(impl.text)} chars of commentary); review with git diff and commit yourself")
+                log("git steps are intentionally NOT automated; per repo:")
+                log('  git add -A && git commit -m "implement plan (dual-agent consensus)"')
     return EXIT_CONSENSUS
 
 
@@ -2171,11 +1826,26 @@ def _merge_batch_verdicts(verdicts: list[Verdict]) -> Verdict:
 
 def review_verify_diff(cfg: Config, prompt: str, per_repo: list[dict],
                        history_dir: Path, round_no: int, session: Optional[str],
-                       review_parse_retries: int) -> tuple[Verdict, Optional[str],
-                                                           list[dict]]:
+                       review_parse_retries: int,
+                       reviewer_is_claude: bool = False) -> tuple[Verdict, Optional[str],
+                                                                  list[dict], Optional[str]]:
     """One review round over the combined diff; above the attach cap, review
     per-file patches in batches and merge the verdicts. Returns the verdict,
-    the last reviewer sessionId (for chaining), and zcode usage entries."""
+    the last reviewer sessionId (for chaining), zcode usage entries, and the
+    model the CLI reported (claude reviewer).
+
+    The zcode reviewer gets the patch as an --attach file; the claude
+    reviewer (verify-reviewer claude, section 5) has no attach mechanism,
+    so the patch text is inlined into its prompt."""
+    def call_review(p: str, patch: Path, sess: Optional[str]) -> AgentResult:
+        if reviewer_is_claude:
+            body = (p + "\n\n=== ATTACHED DIFF (git diff) ===\n"
+                    + patch.read_text(encoding="utf-8")
+                    + "\n=== END DIFF ===")
+            return call_claude(body, cwd=cfg.repo, cfg=cfg, session_id=sess,
+                               permission_mode="plan")
+        return reviewer(p, cfg, sess, attach=patch)
+
     combined = combine_diffs(per_repo)
     batches: list[tuple[str, Path]] = []
     if len(combined) <= VERIFY_DIFF_ATTACH_CAP_CHARS:
@@ -2195,31 +1865,34 @@ def review_verify_diff(cfg: Config, prompt: str, per_repo: list[dict],
     verdicts: list[Verdict] = []
     usages: list[dict] = []
     session_id: Optional[str] = session
+    model: Optional[str] = None
     for note, patch in batches:
-        v = reviewer(prompt + note, cfg, session_id, attach=patch)
+        v = call_review(prompt + note, patch, session_id)
         if not v.ok:
             return (Verdict(approve=False, raw_ok=False, blocking=[], minor=[],
                             open_questions=[], fyi_notes=[], strengths=[],
                             repos_touched=[], summary="reviewer call failed",
-                            raw=""), None, usages)
+                            raw=""), None, usages, model)
         session_id = v.session_id
         usages.append(v.usage)
+        model = model or v.model
         verdicts.append(parse_verdict(v.text))
         for attempt in range(1, review_parse_retries + 1):
             if verdicts[-1].raw_ok:
                 break
             log(f"verify round {round_no}: reviewer reply was not valid JSON - "
                 f"re-asking (parse retry {attempt}/{review_parse_retries})")
-            v = reviewer(prompt + note +
-                         "\n\nIMPORTANT: your PREVIOUS reply was not valid JSON. "
-                         "Respond with ONLY the raw JSON object.", cfg,
-                         session_id, attach=patch)
+            v = call_review(prompt + note +
+                            "\n\nIMPORTANT: your PREVIOUS reply was not valid JSON. "
+                            "Respond with ONLY the raw JSON object.", patch,
+                            session_id)
             if not v.ok:
-                return verdicts[-1], session_id, usages
+                return verdicts[-1], session_id, usages, model
             session_id = v.session_id
             usages.append(v.usage)
+            model = model or v.model
             verdicts[-1] = parse_verdict(v.text)
-    return _merge_batch_verdicts(verdicts), session_id, usages
+    return _merge_batch_verdicts(verdicts), session_id, usages, model
 
 
 def run_verify(cfg: Config, report: RunReport) -> int:
@@ -2266,6 +1939,28 @@ def run_verify(cfg: Config, report: RunReport) -> int:
     artifacts_plan = cfg.plan_path
     excludes = {r: artifact_excludes(r, artifacts_plan) for r in repos}
 
+    # Section 5: with the glm implementer, the verify diff comes from the
+    # delegate run's worktrees (base..working tree), not the caller's tree.
+    delegate_run: Optional[dict] = None
+    if cfg.implementer == "glm":
+        delegate_run = load_delegate_run(cfg.history_dir)
+        if delegate_run and delegate_run.get("model_served"):
+            report.agent_models["implementer"] = (
+                f"zcode {delegate_run['model_served']}")
+            report.agent_models.setdefault(
+                "fixer", report.agent_models["implementer"])
+        if delegate_run is None and not cfg.dry_run:
+            log("note: --implementer glm but no delegate run is recorded for "
+                "this plan - reviewing the caller's tree as usual (was the "
+                "implement step run with a different implementer?)")
+    reviewer_is_claude = cfg.verify_reviewer == "claude"
+    if reviewer_is_claude:
+        log(f"verify reviewer: claude (read-only headless call; implementer "
+            f"was {cfg.implementer})")
+        if cfg.implementer == "claude":
+            log("WARNING: the same model family implements and reviews - the "
+                "point of the loop is a second opinion")
+
     # Per-stage reviewer seeding (Resolved decision 2): verify resumes its OWN
     # stage's sessions, never the consensus stage's review-iter-* ones.
     reviewer_session: Optional[str] = None
@@ -2289,14 +1984,23 @@ def run_verify(cfg: Config, report: RunReport) -> int:
     for i in range(1, cfg.max_iterations + 1):
         iterations_used = i
         report.iterations_used = i
-        log(f"verify round {i}/{cfg.max_iterations}: diffing "
-            f"{len(repos)} repo(s) against the intent")
-        per_repo = [collect_repo_diff(r, excludes[r]) for r in repos]
+        if delegate_run is not None and not cfg.dry_run:
+            per_repo = collect_delegate_diffs(delegate_run, excludes)
+            log(f"verify round {i}/{cfg.max_iterations}: diffing "
+                f"{len(per_repo)} delegate worktree(s) against the intent")
+        else:
+            log(f"verify round {i}/{cfg.max_iterations}: diffing "
+                f"{len(repos)} repo(s) against the intent")
+            per_repo = [collect_repo_diff(r, excludes[r]) for r in repos]
         touched = [r for r in per_repo if r["diff"].strip()]
         if not touched:
             report.outcome = "error"
-            report.error = ("no changes found in the linked repositories' "
-                            "working trees - implement the agreed intent first, "
+            report.error = ("no changes found in the "
+                            + ("delegate worktrees or the linked repositories'"
+                               " working trees"
+                               if delegate_run is not None else
+                               "linked repositories' working trees")
+                            + " - implement the agreed intent first, "
                             "then run verify")
             log(f"ERROR {report.error}")
             return EXIT_ERROR
@@ -2305,13 +2009,20 @@ def run_verify(cfg: Config, report: RunReport) -> int:
                          combine_diffs(per_repo) + "\n")
         prompt = build_verify_review_prompt(cfg.plan_path.name, intent_text,
                                             cfg.review_rules, settled, ledger)
-        verdict, reviewer_session, zcode_usages = review_verify_diff(
-            cfg, prompt, per_repo, cfg.history_dir, i, reviewer_session,
-            cfg.review_parse_retries)
+        verdict, reviewer_session, reviewer_usages, reviewer_model = (
+            review_verify_diff(cfg, prompt, per_repo, cfg.history_dir, i,
+                               reviewer_session, cfg.review_parse_retries,
+                               reviewer_is_claude=reviewer_is_claude))
         last_verdict = verdict
-        for u in zcode_usages:
-            accumulate(u, "zcode")
-        note_reviewer_model(report, reviewer_session)
+        for u in reviewer_usages:
+            accumulate(u, "claude" if reviewer_is_claude else "zcode")
+        if reviewer_is_claude:
+            if "reviewer" not in report.agent_models:
+                report.agent_models["reviewer"] = (
+                    f"claude (model: {reviewer_model})" if reviewer_model
+                    else "claude (model: account default)")
+        else:
+            note_reviewer_model(report, reviewer_session)
         if not verdict.raw_ok:
             # Same safety property as plan mode, starker stakes here: an
             # unreadable review must never be the basis of a commit.
@@ -2374,6 +2085,17 @@ def run_verify(cfg: Config, report: RunReport) -> int:
              "settled_human_decisions": [{"question": q, "answer": a}
                                          for q, a in settled.items()]},
             indent=2)
+        if delegate_run is not None:
+            # glm implementer: blocking objections go back to the GLM session
+            # (delegate resume); the rounds/limit/minors-never-block rules
+            # are exactly the fix loop's.
+            how = delegate_fix(cfg, report, objections_json, intent_text)
+            if how != "ok":
+                return EXIT_ERROR
+            ledger.append({"round": i, "blocking": verdict.blocking,
+                           "fix_summary": "(fixed by the GLM implementer "
+                           "session - see the delegate run)"})
+            continue
         combined_chars = len(combine_diffs(per_repo))
         fix_timeout = min(
             cfg.timeout * REVISE_TIMEOUT_MAX_MULTIPLE,
@@ -2423,6 +2145,27 @@ def run_verify(cfg: Config, report: RunReport) -> int:
         report.outcome = "verify-clean"
         log("DRY-RUN: would commit each touched repo (branch-guarded)")
         return EXIT_CONSENSUS
+    if delegate_run is not None:
+        # glm implementer: branch-guard the CALLER repos first (the diff
+        # under review lives in worktrees, but the commit lands here), then
+        # apply the delegate diff uncommitted and fall through to the same
+        # guarded commit step below. An apply failure commits nothing and
+        # keeps the worktree (plan section 5, Failure).
+        for r in delegate_run.get("repos") or []:
+            branch = _git_branch(Path(str(r["repo"])))
+            if branch in ("main", "master"):
+                log(f"commit BLOCKED: {r['repo']} is on '{branch}'. Create a "
+                    "feature branch and re-run; nothing has been staged or "
+                    "committed.")
+                report.outcome = "blocked-on-branch"
+                report.implement_refused = True
+                report.branch_blocked_repos.append(str(r["repo"]))
+                return EXIT_BLOCKED_ON_BRANCH
+        applied_paths = delegate_apply_all(cfg, report)
+        if applied_paths is None:
+            return EXIT_ERROR
+    else:
+        applied_paths = None
     touched = []
     for r in repos:
         diff = collect_repo_diff(r, excludes[r])
@@ -2442,8 +2185,19 @@ def run_verify(cfg: Config, report: RunReport) -> int:
     commits = []
     for r in touched:
         repo = r["repo"]
-        git_run(repo, "add", "-A", "--", *(["."] + excludes[repo]))
-        git_run(repo, "commit", "-m", message)
+        if applied_paths is not None:
+            # glm implementer: commit exactly the paths delegate applied - the
+            # diff that was reviewed. Anything else uncommitted in the caller's
+            # tree (the human's own parallel edits) was never reviewed and is
+            # left out, including anything they had staged.
+            paths = applied_paths.get(Path(str(repo)).resolve())
+            if not paths:
+                continue
+            git_run(repo, "add", "-A", "--", *paths)
+            git_run(repo, "commit", "-m", message, "--", *paths)
+        else:
+            git_run(repo, "add", "-A", "--", *(["."] + excludes[repo]))
+            git_run(repo, "commit", "-m", message)
         sha = git_run(repo, "rev-parse", "HEAD").stdout.strip()
         commits.append({"repo": str(repo), "branch": r["branch"], "sha": sha})
         log(f"committed {repo.name}@{sha[:10]} on '{r['branch']}' "
@@ -2453,6 +2207,9 @@ def run_verify(cfg: Config, report: RunReport) -> int:
     report.outcome = "verify-clean"
     log(f"VERIFY CLEAN: {len(commits)} commit(s); push stays yours "
         "(git push is never automated)")
+    if delegate_run is not None:
+        # the work now lives in the caller's branch: drop the worktrees
+        delegate_clean_all(cfg, report)
     summary = {
         "outcome": "verify-clean", "strategy": cfg.strategy,
         "rounds_used": iterations_used, "max_iterations": cfg.max_iterations,
@@ -2488,6 +2245,260 @@ def persist_settled_state(history_dir: Path, settled: dict) -> None:
     history_dir.mkdir(parents=True, exist_ok=True)
     settled_state_path(history_dir).write_text(
         json.dumps(settled, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# GLM implementer: the engine drives scripts/delegate.py (plan section 5)
+# --------------------------------------------------------------------------
+
+DELEGATE_SCRIPT = Path(__file__).resolve().parent / "delegate.py"
+
+
+def _delegate_zcode_cli(cfg: "Config") -> list:
+    """--zcode-cli args for delegate.py from the engine's resolved zcode cmd,
+    so a stub in tests or an explicit path carries over unchanged."""
+    cmd = cfg.zcode_cmd
+    if len(cmd) == 2 and Path(cmd[1]).suffix.lower() in (".cjs", ".py"):
+        return ["--zcode-cli", cmd[1]]
+    return []
+
+
+def call_delegate(argv: list, cfg: "Config", label: str) -> dict:
+    """Run delegate.py and parse its one stdout JSON line."""
+    cmd = [sys.executable, str(DELEGATE_SCRIPT), *argv]
+    if argv and argv[0] in ("run", "resume"):
+        # apply/clean/status take no CLI flags; run/resume do
+        cmd += ["--heartbeat", str(max(0, cfg.heartbeat_secs)),
+                *_delegate_zcode_cli(cfg)]
+    log(f"delegate {label}: {' '.join(argv[:4])} ...")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=max(cfg.timeout, 900) * 3)
+    except subprocess.TimeoutExpired:
+        raise OrchestratorError(f"delegate {label} timed out")
+    except OSError as e:
+        raise OrchestratorError(f"delegate {label} failed to launch: {e}")
+    data = None
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        try:
+            data = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if data is None:
+        raise OrchestratorError(
+            f"delegate {label} printed no JSON line: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:300]}")
+    return data
+
+
+def delegate_run_state_path(history_dir: Path) -> Path:
+    return history_dir / "delegate-run.json"
+
+
+def save_delegate_run(history_dir: Path, payload: dict) -> None:
+    history_dir.mkdir(parents=True, exist_ok=True)
+    write_atomic(delegate_run_state_path(history_dir), json.dumps(payload, indent=2))
+
+
+def load_delegate_run(history_dir: Path) -> Optional[dict]:
+    try:
+        data = json.loads(delegate_run_state_path(history_dir)
+                          .read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def build_delegate_brief(cfg: "Config", targets: list) -> Path:
+    """The delegate brief: the same content build_implement_prompt produces
+    today (with the plan EMBEDDED - GLM cannot read the caller's uncommitted
+    plan file from its worktree) plus the exact final reply wanted."""
+    plan_text = cfg.plan_path.read_text(encoding="utf-8").strip()
+    scope = ""
+    if len(targets) > 1:
+        scope = (f"\nThis run spans {len(targets)} repositories; each is "
+                 "linked into your working directory. Implement ONLY the "
+                 "parts of the plan that belong in each repository; record "
+                 "cross-repo contracts in IMPLEMENTATION-NOTES.md rather "
+                 "than stubbing them.\n")
+    brief = (
+        "# Implementation brief (countersign)\n\n"
+        "Implement the plan below in the provided worktree(s) now. Follow it "
+        "exactly. Where the plan is ambiguous, choose the simplest option and "
+        "record the decision in IMPLEMENTATION-NOTES.md. Run the tests the "
+        "plan specifies if the environment allows it.\n"
+        + scope +
+        "\n## Final reply\n"
+        "Your final message must list: the files changed with a one-line "
+        "summary each; the checks you ran and their results; any existing "
+        "test you changed and why; anything you decided that the plan did "
+        "not say.\n"
+        "\n=== PLAN (the agreed spec) ===\n" + plan_text + "\n=== END PLAN ===\n")
+    path = cfg.history_dir / "delegate-brief.md"
+    cfg.history_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(brief, encoding="utf-8")
+    return path
+
+
+def delegate_implement(cfg: "Config", report: RunReport, targets: list) -> str:
+    """One delegate run (or a resume of a prior rate-limited run) covering
+    the implement targets. Returns 'ok' | 'rate-limited' | 'error'."""
+    prior = load_delegate_run(cfg.history_dir)
+    brief = build_delegate_brief(cfg, targets)
+    common = ["--timeout", str(cfg.timeout)]
+    for c in cfg.checks:
+        common += ["--check", c]
+    if prior and prior.get("run_id") and prior.get("outcome") != "done":
+        log(f"resuming delegate run {prior['run_id']} "
+            f"(prior outcome {prior.get('outcome')})")
+        argv = ["resume", prior["run_id"], *common]
+    elif prior and prior.get("outcome") == "done":
+        log(f"delegate run {prior['run_id']} already done - skipping the "
+            "implement pass")
+        report.delegate_run_id = prior.get("run_id")
+        report.repos_touched = prior.get("repos_touched") or [str(t) for t in targets]
+        return "ok"
+    else:
+        argv = ["run", "--brief", str(brief), *common]
+        for t in targets:
+            argv += ["--repo", str(t)]
+    res = call_delegate(argv, cfg, "implement")
+    run_id = res.get("run_id")
+    report.delegate_run_id = run_id
+    save_delegate_run(cfg.history_dir, {
+        "run_id": run_id, "outcome": res.get("outcome"),
+        "repos": res.get("repos") or [],
+        "model_served": res.get("model_served"),
+        "repos_touched": [str(t) for t in targets]})
+    for w in res.get("warnings") or []:
+        if w not in report.warnings:
+            report.warnings.append(w)
+    if res.get("model_served"):
+        report.agent_models["implementer"] = f"zcode {res['model_served']}"
+    outcome = res.get("outcome")
+    if outcome == "done":
+        log(f"delegate implement done (run {run_id}); changes are in the "
+            "worktree(s), the caller's tree is untouched")
+        report.repos_touched = [str(t) for t in targets]
+        return "ok"
+    if outcome == "rate-limited":
+        report.outcome = "rate-limited"
+        report.error = (f"delegate implement hit the z.ai usage limit "
+                        f"(run {run_id}): {res.get('error', '')[:300]} - "
+                        "re-running later resumes the same delegate run "
+                        "instead of starting over")
+        log("RATE-LIMITED: " + report.error)
+        return "rate-limited"
+    report.outcome = "error"
+    report.error = (f"delegate implement failed (run {run_id}, outcome "
+                    f"{outcome}): {res.get('error', '')[:400]} - the "
+                    "worktree is kept for inspection")
+    log(f"ERROR {report.error}")
+    return "error"
+
+
+def delegate_fix(cfg: "Config", report: RunReport, objections_json: str,
+                 intent_text: str) -> str:
+    """Fix round for the glm implementer: resume the GLM session with the
+    blocking objections as the prompt. Returns 'ok' | 'rate-limited' | 'error'."""
+    run_id = report.delegate_run_id or (load_delegate_run(cfg.history_dir) or {}).get("run_id")
+    if not run_id:
+        report.outcome = "error"
+        report.error = "verify fix needs a delegate run id but none is recorded"
+        return "error"
+    prompt = (
+        "COUNTERSIGN DELEGATE (verify fix round). The reviewer examined your "
+        "work and returned the BLOCKING objections below. Fix every one in "
+        "the provided worktree(s); change only what the objections require "
+        "plus what is directly implied. Run the relevant tests if the "
+        "environment allows. Reply with a SHORT summary (at most ~10 lines) "
+        "of exactly what you changed.\n"
+        "\n=== INTENT DOC (the agreed rubric) ===\n" + intent_text + "\n=== END INTENT ===\n"
+        "\n=== REVIEWER OBJECTIONS (JSON) ===\n" + objections_json + "\n=== END OBJECTIONS ===")
+    res = call_delegate(["resume", run_id, "--prompt", prompt,
+                         "--timeout", str(cfg.timeout)], cfg, "fix")
+    for w in res.get("warnings") or []:
+        if w not in report.warnings:
+            report.warnings.append(w)
+    if res.get("model_served"):
+        report.agent_models["fixer"] = f"zcode {res['model_served']}"
+    outcome = res.get("outcome")
+    if outcome == "done":
+        log(f"delegate fix round done (run {run_id}): "
+            f"{str(res.get('reply', ''))[:120]}")
+        return "ok"
+    if outcome == "rate-limited":
+        report.outcome = "rate-limited"
+        report.error = (f"delegate fix hit the z.ai usage limit (run "
+                        f"{run_id}): {res.get('error', '')[:300]}")
+        log("RATE-LIMITED: " + report.error)
+        return "rate-limited"
+    report.outcome = "error"
+    report.error = (f"delegate fix failed (run {run_id}, outcome {outcome}): "
+                    f"{res.get('error', '')[:400]}")
+    log(f"ERROR {report.error}")
+    return "error"
+
+
+def collect_delegate_diffs(delegate_run: dict, excludes: dict) -> list:
+    """The glm-implementer verify diff source: each delegate worktree's
+    base..working-tree diff (committed, staged, unstaged and new files via
+    intent-to-add - plan 2g), keyed by the CALLER repo so the commit gate
+    still commits the right repository."""
+    out = []
+    for r in delegate_run.get("repos") or []:
+        repo = Path(str(r["repo"]))
+        wt = Path(str(r["worktree"]))
+        base = str(r["base"])
+        if not wt.is_dir():
+            continue
+        git_run(wt, "add", "-A", "-N", "--", ".")
+        diff = git_run(wt, "diff", "--binary", base, "--", ".").stdout
+        out.append({"repo": repo, "branch": _git_branch(repo), "diff": diff,
+                    "delegate_worktree": str(wt), "delegate_base": base,
+                    "glm_committed": git_run(wt, "rev-parse", "HEAD"
+                                             ).stdout.strip() != base})
+    return out
+
+
+def delegate_apply_all(cfg: "Config", report: RunReport) -> Optional[dict]:
+    """apply the delegate diff into the caller's repos (uncommitted). Returns
+    {resolved repo path: [applied paths]}, the exact set the commit may take;
+    None when apply failed (the engine then commits nothing and keeps the
+    worktree)."""
+    run_id = report.delegate_run_id or (load_delegate_run(cfg.history_dir) or {}).get("run_id")
+    if not run_id:
+        report.outcome = "error"
+        report.error = "delegate apply needs a delegate run id but none is recorded"
+        return None
+    res = call_delegate(["apply", run_id], cfg, "apply")
+    if res.get("outcome") != "done":
+        report.outcome = "error"
+        report.delegate_run_id = run_id
+        report.error = (f"delegate apply failed (run {run_id}): "
+                        f"{res.get('error', '')[:400]} - nothing was "
+                        "committed and the worktree is kept")
+        log(f"ERROR {report.error}")
+        return None
+    log(f"delegate apply landed the diff uncommitted (run {run_id})")
+    return {Path(str(a["repo"])).resolve(): list(a.get("paths") or [])
+            for a in res.get("applied") or []}
+
+
+def delegate_clean_all(cfg: "Config", report: RunReport) -> None:
+    """Remove the delegate worktrees/branches; a refusal is a warning (the
+    work is already committed - the human can force-clean later)."""
+    run_id = report.delegate_run_id or (load_delegate_run(cfg.history_dir) or {}).get("run_id")
+    if not run_id:
+        return
+    cres = call_delegate(["clean", run_id], cfg, "clean")
+    if cres.get("outcome") != "done":
+        w = (f"delegate clean refused (run {run_id}): "
+             f"{cres.get('error', '')[:200]} - worktree kept")
+        report.warnings.append(w)
+        log("WARNING: " + w)
 
 
 def resolve_implement_targets(cfg: "Config", verdict: Optional["Verdict"]) -> list:
@@ -2774,6 +2785,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "spans multiple repos; REPEAT the flag for tasks spanning "
                         "several repos - each gets its own branch-guarded pass "
                         "scoped to its part of the plan")
+    p.add_argument("--implementer", choices=["claude", "glm"], default=None,
+                   help="who implements after consensus (valid with --implement "
+                        "and --verify): claude (default, today's behavior) or glm "
+                        "(delegate.py runs GLM in isolated worktrees; z.ai tokens "
+                        "are spent, the caller's tree stays untouched until the "
+                        "verify commit gate). Default also settable as "
+                        "countersign.implementer in ~/.countersign/config.json")
+    p.add_argument("--verify-reviewer", choices=["glm", "claude"], default=None,
+                   help="who reviews the diff in --verify: the model that did "
+                        "NOT implement by default (glm when claude implemented - "
+                        "today's behavior; claude when glm implemented)")
+    p.add_argument("--check", metavar='"<repo>:<cmd> | <cmd>"', action="append",
+                   default=[],
+                   help="with --implementer glm: a command run in the delegate "
+                        "worktree(s) after GLM finishes (passed through to "
+                        "delegate.py unchanged); prefix '<repo>:<cmd>' to scope "
+                        "one repo. REPEAT per command. Without it delegate runs "
+                        "no checks and the reviewer runs them")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECS,
                    help=f"per-call timeout in seconds (default {DEFAULT_TIMEOUT_SECS})")
     p.add_argument("--max-retries", type=int, default=2,
@@ -2916,6 +2945,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise
             log(f"preflight note: {e} — continuing so the zcode side can still be checked")
             claude_cmd = ["claude"]
+        # Section 5: implementer / verify-reviewer resolution. Flag wins over
+        # countersign.implementer in ~/.countersign/config.json; the verify
+        # reviewer defaults to the model that did NOT implement.
+        cs_cfg = load_countersign_config()
+        implementer = args.implementer or \
+            (cs_cfg.get("countersign") or {}).get("implementer") or "claude"
+        if implementer not in ("claude", "glm"):
+            raise OrchestratorError(
+                f"countersign.implementer must be 'claude' or 'glm', not "
+                f"{implementer!r}")
+        verify_reviewer = args.verify_reviewer or \
+            ("claude" if implementer == "glm" else "glm")
+        if not (args.implement or args.verify) and (
+                args.implementer or args.verify_reviewer or args.check):
+            log("note: --implementer/--verify-reviewer/--check only take "
+                "effect with --implement or --verify - ignoring them")
         cfg = Config(
             zcode_cmd=resolve_zcode_cmd(args.zcode_cli, args.dry_run),
             claude_cmd=claude_cmd,
@@ -2941,9 +2986,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             fork_transcript=fork_transcript,
             fork_explicit=bool(args.fork_session_id),
             heartbeat_secs=max(0, args.heartbeat),
+            implementer=implementer,
+            verify_reviewer=verify_reviewer,
+            checks=list(args.check or []),
         )
         log(f"drafter : {' '.join(cfg.claude_cmd)}")
         log(f"reviewer: {' '.join(cfg.zcode_cmd)}")
+        if args.implement or args.verify:
+            log(f"implementer={cfg.implementer} verify-reviewer={cfg.verify_reviewer}"
+                + ("  [WARNING: same model family implements and reviews - the "
+                   "point is a second opinion]"
+                   if (cfg.implementer == "glm") == (cfg.verify_reviewer == "glm")
+                   else ""))
         pin = zcode_configured_model()
         log(f"reviewer model pin (from ~/.zcode/cli/config.json): {pin}" if pin else
             "reviewer model pin: unset (CLI default; actual model logged "
@@ -2954,6 +3008,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"strategy={cfg.strategy} max-iterations={cfg.max_iterations} repo={cfg.repo}")
         global HEARTBEAT_SECS
         HEARTBEAT_SECS = cfg.heartbeat_secs
+        # _run() lives in zcode_common now; its heartbeat reads that module's
+        # global, so mirror the per-run value there (kept name above for compat).
+        set_heartbeat_secs(cfg.heartbeat_secs)
         report = RunReport(
             plan=str(cfg.plan_path), history_dir=str(cfg.history_dir),
             strategy=cfg.strategy)   # forked_from_session set only when the

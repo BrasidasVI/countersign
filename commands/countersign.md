@@ -1,6 +1,6 @@
 ---
 description: Plan mode - dual-agent consensus on a planning doc (GLM reviews, headless Claude revises, loop until consensus). For implementing a discussed change, use the countersign skill instead.
-argument-hint: <plan-file.md> [--implement] [--iterations N]
+argument-hint: <plan-file.md> [--implement] [--implementer glm] [--iterations N]
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
@@ -75,8 +75,22 @@ PYTHON="$(command -v python3 || command -v python)"
   --context-brief "<plan-dir>/.countersign/<plan-stem>-context-brief.md" \
   [--decisions "<decisions file>" (only when resuming after answers)] \
   [--implement] \
+  [--implementer glm (with --implement: GLM implements in delegate worktrees \
+via scripts/delegate.py; z.ai tokens, repos untouched until verify commits; \
+default claude, or countersign.implementer in ~/.countersign/config.json)] \
+  [--verify-reviewer glm|claude (who reviews the diff in the later --verify \
+run; default: the model that did not implement)] \
+  [--check "<repo>:<cmd> | <cmd>" (with --implementer glm: passed through to \
+delegate.py; commands run in the delegate worktree after GLM finishes)] \
   [--max-iterations N (only when --iterations given)]
 ```
+
+If Stage 3 was delegated (`--implementer glm`), the later verify run must
+pass `--verify --implementer glm` too: the engine then reviews the
+delegate worktree diff (Claude by default), sends blocking objections back
+to the GLM session, and on a clean review applies, commits (guarded, with
+the trailer) and cleans the worktrees. A `rate-limited` outcome carries
+the delegate run id; a re-run resumes it instead of starting over.
 
 The engine resolves everything else itself: the repo set (saved project
 sets matched by membership, else the plan's own repository - pass

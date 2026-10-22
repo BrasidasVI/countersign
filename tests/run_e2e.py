@@ -694,6 +694,173 @@ with tempfile.TemporaryDirectory(prefix="cs-e2e-") as td:
           rep.get("forked_from_session") is None,
           str(rep.get("forked_from_session")))
 
+    # ------------- glm implementer: delegate does the work (section 5) -------
+
+    def glm_home(name):
+        h = T / f"fakehome-{name}"
+        h.mkdir(parents=True, exist_ok=True)
+        return h
+
+    def glm_env(h, claude_mode=None, stub_mode=None):
+        """env_extra for glm-implementer runs: isolated HOME (delegate writes
+        the zcode config there) + isolated stub state + optional claude mode."""
+        env = {"HOME": str(h), "CS_STUB_STATE_DIR": str(h / "stub-state")}
+        if claude_mode:
+            env["CS_CLAUDE_MODE"] = claude_mode
+        return env
+
+    print("scenario W1: --implementer glm -> delegate implements, claude reviews")
+    fh_w1 = glm_home("w1")
+    gx(repoA, "checkout", "-q", "-b", "feat/w1")
+    planW1 = make_plan(repoA, "plan-w1.md", "# Plan W1\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planW1, [repoA, repoB],
+                              extra=["--implement", "--implementer", "glm"],
+                              stub_mode="approve",
+                              env_extra=glm_env(fh_w1))
+    check("W1 implement exit 0", rc == 0, f"rc={rc} {err[-400:] if rc else ''}")
+    check("W1 consensus + implement attempted",
+          rep and rep.get("outcome") == "consensus"
+          and rep.get("implement_attempted") is True, str(rep)[:160])
+    check("W1 delegate run id in report", bool(rep.get("delegate_run_id")),
+          str(rep.get("delegate_run_id")))
+    check("W1 caller tree untouched by the implement pass",
+          "delegated line" not in (repoA / "README.md").read_text(encoding="utf-8")
+          and not (repoA / "glm-new-file.txt").exists())
+    run_w1 = rep["delegate_run_id"]
+    wt_w1 = Path(str(repoA) + f"-glm-{run_w1}")
+    check("W1 delegate worktree holds the work",
+          wt_w1.is_dir() and "delegated line" in (wt_w1 / "README.md")
+          .read_text(encoding="utf-8"))
+    # The human's own parallel edit, never part of the delegate diff: verify
+    # must not commit it.
+    (repoA / "owner-notes.txt").write_text("owner's own edit\n", encoding="utf-8")
+    rc, rep, err = run_engine(planW1, [repoA, repoB],
+                              extra=["--verify", "--implementer", "glm"],
+                              stub_mode="approve",
+                              env_extra=glm_env(fh_w1))
+    check("W1 verify exit 0", rc == 0, f"rc={rc} {err[-400:] if rc else ''}")
+    check("W1 verify-clean with a commit",
+          rep and rep.get("outcome") == "verify-clean" and bool(rep.get("commits")),
+          str(rep)[:200])
+    check("W1 work landed in the caller tree",
+          "delegated line" in (repoA / "README.md").read_text(encoding="utf-8")
+          and (repoA / "glm-new-file.txt").is_file())
+    head_w1 = gx(repoA, "log", "-1", "--format=%B").stdout
+    check("W1 commit carries the trailer", "countersign: verified" in head_w1,
+          head_w1[:200])
+    committed_w1 = gx(repoA, "show", "--name-only", "--format=").stdout.split()
+    check("W1 new file committed unasked-for paths excluded",
+          "glm-new-file.txt" in committed_w1
+          and not any(".countersign" in f for f in committed_w1),
+          str(committed_w1))
+    check("W1 the owner's unrelated edit is left uncommitted",
+          "owner-notes.txt" not in committed_w1
+          and (repoA / "owner-notes.txt").is_file()
+          and "owner-notes.txt" not in gx(repoA, "ls-tree", "-r", "--name-only", "HEAD").stdout,
+          f"{committed_w1} exists={(repoA / 'owner-notes.txt').is_file()} "
+          f"status={gx(repoA, 'status', '--porcelain').stdout!r}")
+    (repoA / "owner-notes.txt").unlink(missing_ok=True)
+    check("W1 worktree + glm branch cleaned",
+          not wt_w1.exists()
+          and f"glm/{run_w1}" not in gx(repoA, "branch", "--list").stdout)
+    check("W1 agent models recorded",
+          "implementer" in rep.get("agent_models", {})
+          and "reviewer" in rep.get("agent_models", {}),
+          json.dumps(rep.get("agent_models"))[:200])
+
+    print("scenario W2: claude-reviewer blocking -> GLM fix round -> clean")
+    fh_w2 = glm_home("w2")
+    gx(repoA, "checkout", "-q", "-b", "feat/w2")
+    planW2 = make_plan(repoA, "plan-w2.md", "# Plan W2\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planW2, [repoA, repoB],
+                              extra=["--implement", "--implementer", "glm"],
+                              stub_mode="approve",
+                              env_extra=glm_env(fh_w2))
+    check("W2 implement exit 0", rc == 0, f"rc={rc}")
+    run_w2 = rep["delegate_run_id"]
+    hist_w2 = Path(rep["history_dir"])
+    rc, rep, err = run_engine(planW2, [repoA, repoB],
+                              extra=["--verify", "--implementer", "glm"],
+                              stub_mode="approve",
+                              env_extra=dict(glm_env(fh_w2, "verifyonce"),
+                                         CS_STUB_KEY="w2fix"))
+    check("W2 fix-loop exit 0", rc == 0, f"rc={rc} {err[-400:] if rc else ''}")
+    check("W2 fix-loop verify-clean", rep and rep.get("outcome") == "verify-clean",
+          str(rep)[:200])
+    check("W2 two review rounds (objection then approval)",
+          rep.get("iterations_used") == 2, str(rep.get("iterations_used")))
+    committed_w2 = gx(repoA, "show", "--name-only", "--format=").stdout.split()
+    check("W2 GLM fix landed and was committed",
+          "delegate-fix-applied.txt" in committed_w2
+          and "README.md" in committed_w2, str(committed_w2))
+    resumes_w2 = (fh_w2 / "stub-state" / "cs-stub-state" / "cs-stub-state")
+    resumes_w2 = fh_w2 / "stub-state" / "cs-stub-state"
+    all_resumes_w2 = " ".join(f.read_text(encoding="utf-8")
+                              for f in resumes_w2.glob("*.resumes"))
+    check("W2 blocking objections reached a RESUMED GLM session",
+          "stub-zcode-1" in all_resumes_w2, all_resumes_w2[:160])
+    check("W2 three diff snapshots (impl, post-fix)",
+          (hist_w2 / "verify-diff-v01.patch").is_file()
+          and (hist_w2 / "verify-diff-v02.patch").is_file())
+    check("W2 worktree cleaned after commit",
+          not Path(str(repoA) + f"-glm-{run_w2}").exists())
+
+    print("scenario W3: rate-limited delegate -> engine rate-limited; re-run resumes")
+    fh_w3 = glm_home("w3")
+    gx(repoA, "checkout", "-q", "-b", "feat/w3")
+    planW3 = make_plan(repoA, "plan-w3.md", "# Plan W3\n\nGoal: stub goal.\n")
+    readme_w3_before = (repoA / "README.md").read_text(encoding="utf-8")
+    rc, rep, err = run_engine(planW3, [repoA, repoB],
+                              extra=["--implement", "--implementer", "glm"],
+                              stub_mode="delegate_limit",
+                              env_extra=glm_env(fh_w3))
+    check("W3 engine outcome rate-limited", rc == 2
+          and rep and rep.get("outcome") == "rate-limited", f"rc={rc} {str(rep)[:160]}")
+    check("W3 delegate run id recorded for the resume",
+          bool(rep.get("delegate_run_id")), str(rep.get("delegate_run_id")))
+    hist_w3 = Path(rep["history_dir"])
+    check("W3 delegate-run.json persisted",
+          json.loads((hist_w3 / "delegate-run.json").read_text(encoding="utf-8"))
+          .get("outcome") == "rate-limited")
+    check("W3 caller tree untouched",
+          (repoA / "README.md").read_text(encoding="utf-8") == readme_w3_before)
+    rc, rep, err = run_engine(planW3, [repoA, repoB],
+                              extra=["--implement", "--implementer", "glm"],
+                              stub_mode="delegate_limit",
+                              env_extra=glm_env(fh_w3))
+    check("W3 re-run resumes instead of restarting",
+          rc == 0 and rep.get("outcome") == "consensus"
+          and rep.get("delegate_run_id") == json.loads(
+              (hist_w3 / "delegate-run.json").read_text(encoding="utf-8"))
+          ["run_id"], f"rc={rc} {str(rep)[:200]}")
+    wt_w3 = Path(str(repoA) + f"-glm-{rep['delegate_run_id']}")
+    check("W3 resumed delegate did the work in the worktree (caller intact)",
+          (repoA / "README.md").read_text(encoding="utf-8") == readme_w3_before
+          and wt_w3.is_dir()
+          and (wt_w3 / "README.md").read_text(encoding="utf-8").count(
+              "delegated line") > readme_w3_before.count("delegated line"))
+    resumes_w3 = fh_w3 / "stub-state" / "cs-stub-state"
+    all_resumes_w3 = " ".join(f.read_text(encoding="utf-8")
+                              for f in resumes_w3.glob("*.resumes"))
+    check("W3 the limited session was resumed", "stub-zcode-1" in all_resumes_w3,
+          all_resumes_w3[:160])
+
+    print("scenario W4: --implementer glm on main refused exactly as today")
+    gx(repoA, "checkout", "-q", "main")
+    planW4 = make_plan(repoA, "plan-w4.md", "# Plan W4\n\nGoal: stub goal.\n")
+    rc, rep, err = run_engine(planW4, [repoA, repoB],
+                              extra=["--implement", "--implementer", "glm"],
+                              stub_mode="approve",
+                              env_extra=glm_env(glm_home("w4")))
+    check("W4 guard exit 5", rc == 5, f"rc={rc}")
+    check("W4 outcome blocked-on-branch",
+          rep and rep.get("outcome") == "blocked-on-branch", str(rep)[:160])
+    check("W4 no delegate run started",
+          not (Path(rep["history_dir"]) / "delegate-run.json").exists()
+          and not (repoA / "README.md").read_text(encoding="utf-8")
+          .startswith("delegated"))
+    gx(repoA, "checkout", "-q", "feat/w1")   # leave the repo on a feature branch
+
     print("scenario R: claude's stdout-JSON spend-limit error is diagnosed")
     planR = make_plan(repoA, "plan-r.md", "# Plan R\n\nGoal: stub goal.\n")
     rc, rep, err = run_engine(planR, [repoA, repoB], stub_mode="spendlimit")

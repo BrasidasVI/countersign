@@ -78,15 +78,40 @@ On consensus: create/switch to a feature branch in each target repo
 (never implement on main/master; propose a branch name if creating).
 Implement the APPROACH from the intent doc. Keep changes uncommitted.
 
+**Who implements — the GLM option (0.10.0).** By default YOU implement.
+If the human says GLM should implement, or `countersign.implementer` is
+`glm` in `~/.countersign/config.json`, do NOT implement yourself: run the
+engine instead (background, same JSON contract):
+
+```bash
+python3 <engine> "<intent doc path>" --implement --implementer glm \
+  --fork-invocation-nonce "cs-<new-nonce>"
+```
+
+GLM then implements in isolated delegate worktrees (z.ai tokens are
+spent; the repos stay untouched). `rate-limited` means the z.ai quota
+refused or hit mid-run — the delegate run id is in the report and a
+re-run resumes it instead of starting over; tell the human and wait.
+Then run Stage 4 with `--verify --implementer glm` as well.
+
 ## Stage 4 - verify + commit
 
 Re-run the engine in verify mode (background, same JSON contract):
 
 ```bash
-python3 <engine> "<intent doc path>" --verify --fork-invocation-nonce "cs-<new-nonce>"
+python3 <engine> "<intent doc path>" --verify [--implementer glm] \
+  --fork-invocation-nonce "cs-<new-nonce>"
 ```
 
-The engine diffs each linked repo (merge-base with its default branch
+Pass `--implementer glm` whenever Stage 3 delegated: the engine reviews
+the delegate worktree diff (Claude reviews by default — the model that
+did not implement), blocking objections go back to the GLM session, and
+on a clean review the engine applies the diff, commits each repo through
+the same guarded gate, and cleans up the worktrees. `--verify-reviewer
+glm|claude` overrides who reviews (same model on both sides logs a
+warning — the point is a second opinion).
+
+The engine diffs each linked repo (merge-base with the default branch
 through the working tree), reviews against the intent doc, fixes blocking
 objections with a forked headless session between rounds, and on a clean
 review COMMITS each touched repo (refusing main/master; message carries
