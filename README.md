@@ -107,6 +107,23 @@ last resort — on Linux that is the Electron desktop binary, which does not
 serve headless prompts. Nonstandard install location? Pass
 `--zcode-cli <path to zcode.cjs>`.
 
+**OS-keyring credentials (ZCode app 3.18.2+, handled automatically; 0.10.1).** The
+app migrates the shared login (`~/.zcode/v2/credentials.json`) to
+OS-keyring encryption (`enc:v2:os:` entries). The standalone CLI decrypts
+those through `@napi-rs/keyring` — a package that lives only inside the
+Electron app's `app.asar`, so the /opt bundle cannot import it: without help
+every headless run dies with `Select a model before sending a message` (no
+account provider → the default model selection cannot resolve), and with
+`--verbose` the process even hangs after the error. When the os-encrypted
+credentials are present and the bundle cannot resolve the keyring package,
+the engine builds a private launch copy of the bundle under
+`~/.countersign/zcode-launch/<bundle size-mtime>/` — same `glm`/`config`
+layout (the builtin-catalog probe keeps working), plus the app's
+`@napi-rs/keyring*` packages extracted from `app.asar` (native `.node`
+symlinked from `app.asar.unpacked`) — and runs that instead. The key
+changes with the bundle, so a ZCode app update rebuilds it. Machines
+without os-encrypted credentials (pre-3.18.2) skip all of this.
+
 ## Use
 
 **Implement flow (skill):** discuss a change in a normal session, then say
@@ -318,6 +335,7 @@ example.
 | `skills/delegate/SKILL.md` | The delegate skill: brief template, running the runner, the mandatory review, apply/clean. |
 | `tests/run_delegate_e2e.py` | Delegate runner e2e test with a stub ZCode (zero model spend): `python3 tests/run_delegate_e2e.py` |
 | `tests/run_e2e.py` | End-to-end engine test with stub agents (zero model spend): `python3 tests/run_e2e.py` |
+| `tests/test_zcode_keyring_launch.py` | Unit tests for the os-keyring launch-dir shim against a fake app layout incl. a format-true asar (zero model spend): `python3 tests/test_zcode_keyring_launch.py` |
 
 ## Migrating from the terminal launcher (v0.1)
 

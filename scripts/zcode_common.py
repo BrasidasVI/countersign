@@ -123,7 +123,7 @@ def resolve_zcode_cmd(explicit: Optional[str], dry_run: bool) -> list[str]:
     ]
     for c in candidates:
         if c.is_file():
-            return _node_prefix(str(c))
+            return _node_prefix(str(_keyring_aware_cjs(c, dry_run)))
     if shutil.which("zcode"):
         return ["zcode"]
     if dry_run:
@@ -143,11 +143,192 @@ def _node_prefix(cjs_path: str) -> list[str]:
     return [node, cjs_path]
 
 
+# --------------------------------------------------------------------------
+# OS-keyring credential decryption (ZCode app 3.18.2+, measured 2026-11-16)
+# --------------------------------------------------------------------------
+# The app migrates the shared ~/.zcode/v2/credentials.json to OS-keyring
+# encryption ("enc:v2:os:" entries, secret in the desktop keyring under the
+# service "ZCode Credential Encryption"). The headless CLI decrypts those via
+# a dynamic import("@napi-rs/keyring") - but the /opt bundle sits outside the
+# Electron app's module tree, so the import fails standalone, the account
+# providers (account:zai-*-plan) are never provisioned, and the default model
+# selection cannot resolve: the CLI then dies with "Select a model before
+# sending a message" and, with --verbose, hangs until killed. The fix is a
+# private launch copy of the bundle with the app's @napi-rs/keyring packages
+# (JS wrapper extracted from app.asar, native .node symlinked from
+# app.asar.unpacked) placed on its module resolution path.
+LAUNCH_ROOT = Path.home() / ".countersign" / "zcode-launch"
+
+
+def _credentials_use_os_keyring() -> bool:
+    try:
+        blob = (Path.home() / ".zcode" / "v2" / "credentials.json") \
+            .read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "enc:v2:os:" in blob
+
+
+def _keyring_resolvable(cjs: Path) -> bool:
+    """True when import("@napi-rs/keyring") can resolve from the bundle's dir.
+
+    Mirrors node's node_modules walk-up: any ancestor directory of the script
+    carrying node_modules/@napi-rs/keyring/package.json makes the import work.
+    """
+    d = cjs.parent
+    while True:
+        if (d / "node_modules" / "@napi-rs" / "keyring" / "package.json").is_file():
+            return True
+        if d.parent == d:
+            return False
+        d = d.parent
+
+
+def _asar_read_index(asar: Path) -> Optional[tuple]:
+    """Parse an Electron app.asar header -> (data-base-offset, directory tree).
+
+    Layout: 4 little-endian uint32s (pickle framing), the last one being the
+    JSON directory length; file content offsets in the tree are relative to
+    the 4-byte-aligned end of that JSON blob. Returns None when unreadable.
+    """
+    import struct
+    try:
+        with asar.open("rb") as f:
+            head = f.read(16)
+            if len(head) < 16:
+                return None
+            json_len = struct.unpack("<IIII", head)[3]
+            raw = f.read(json_len)
+            if len(raw) != json_len:
+                return None
+            tree = json.loads(raw.decode("utf-8"))
+            base = 16 + json_len + ((-json_len) % 4)
+            return base, tree
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def _build_keyring_launch_dir(cjs: Path) -> Optional[Path]:
+    """Materialize ~/.countersign/zcode-launch/<bundle-key>/ and return its cjs.
+
+    The launch copy keeps the app's glm/config sibling layout (so the builtin
+    provider-catalog probe next to the bundle still works) and adds
+    node_modules/@napi-rs/keyring* from the app's asar. Reused while the
+    bundle's size+mtime key matches; rebuilt after a ZCode app update.
+    Returns None when the app layout does not match expectations (caller
+    then falls back to the original bundle and its usual error path).
+    """
+    resources = cjs.parent.parent          # <app>/resources
+    asar = resources / "app.asar"
+    unpacked_root = resources / "app.asar.unpacked"
+    if not (asar.is_file() and unpacked_root.is_dir()):
+        return None
+    parsed = _asar_read_index(asar)
+    if parsed is None:
+        return None
+    base, tree = parsed
+    try:
+        napi = tree["files"]["node_modules"]["files"]["@napi-rs"]["files"]
+    except (KeyError, TypeError):
+        return None
+
+    def rel_files(pkg_files: dict, prefix: str):
+        for fname, meta in (pkg_files or {}).items():
+            rel = f"{prefix}/{fname}"
+            if meta.get("unpacked"):
+                yield rel, ("link", unpacked_root / rel, None)
+            elif "offset" in meta and "size" in meta:
+                yield rel, ("extract", base + int(meta["offset"]), int(meta["size"]))
+
+    entries = {}
+    for pkg, node in sorted(napi.items()):
+        if not pkg.startswith("keyring"):
+            continue
+        for rel, spec in rel_files(node.get("files"), f"node_modules/@napi-rs/{pkg}"):
+            entries[rel] = spec
+    if "node_modules/@napi-rs/keyring/index.js" not in entries:
+        return None
+
+    st = cjs.stat()
+    key = f"{st.st_size}-{int(st.st_mtime_ns)}"
+    launch_dir = LAUNCH_ROOT / key
+    launch_cjs = launch_dir / "glm" / "zcode.cjs"
+    marker = launch_dir / ".ready"
+    if marker.is_file() and launch_cjs.is_file():
+        return launch_cjs
+
+    import tempfile
+    LAUNCH_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".build-", dir=LAUNCH_ROOT) as td:
+        tmp = Path(td)
+        (tmp / "glm").mkdir(parents=True)
+        shutil.copy2(cjs, tmp / "glm" / "zcode.cjs")
+        with asar.open("rb") as f:
+            for rel, (kind, a, b) in sorted(entries.items()):
+                dest = tmp / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "link":
+                    try:
+                        os.symlink(a, dest)
+                        continue
+                    except OSError:
+                        pass           # Windows / restricted fs: copy instead
+                    if not Path(a).is_file():
+                        continue
+                    shutil.copy2(a, dest)
+                else:
+                    f.seek(a)
+                    data = f.read(b)
+                    if len(data) != b:
+                        raise OSError(f"short read for {rel} in {asar}")
+                    dest.write_bytes(data)
+        # keep the builtin provider catalog probe (sibling config/) working and
+        # live: symlink when possible, else copy the one file that is probed
+        cfg_link = tmp / "config"
+        try:
+            os.symlink(resources / "config", cfg_link)
+        except OSError:
+            src = resources / "config" / "provider" / "zcode-builtin.json"
+            if src.is_file():
+                (tmp / "config" / "provider").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, tmp / "config" / "provider" / "zcode-builtin.json")
+        (tmp / ".ready").write_text("ok\n", encoding="utf-8")
+        try:
+            os.rename(tmp, launch_dir)
+        except OSError:
+            if not (marker.is_file() and launch_cjs.is_file()):
+                return None        # lost a concurrent build AND it is incomplete
+    log(f"zcode launch dir built (keyring shim): {launch_cjs}")
+    return launch_cjs
+
+
+def _keyring_aware_cjs(cjs: Path, dry_run: bool) -> Path:
+    """The bundle to run: a keyring-shimmed launch copy when the app's
+    os-keyring-encrypted credentials otherwise cannot be decrypted.
+
+    No-op (returns the original) when the credentials are not os-encrypted
+    (pre-3.18.2 machines), when the bundle already resolves @napi-rs/keyring,
+    or when the launch dir cannot be built - the failure then surfaces through
+    the CLI's own error, which _zcode_failure_hint explains.
+    """
+    if dry_run:
+        return cjs
+    try:
+        if not _credentials_use_os_keyring() or _keyring_resolvable(cjs):
+            return cjs
+        return _build_keyring_launch_dir(cjs) or cjs
+    except OSError:
+        return cjs
+
+
 def _zcode_explicit_cmd(explicit: str) -> list[str]:
     # A .cjs bundle needs node; a .py needs this interpreter (keeps stub-agent
     # testing free of cmd.exe wrapper quoting); anything else runs as-is.
+    # Explicit .cjs paths get the same keyring-shim treatment as the bundled
+    # one (a no-op unless the os-keyring credentials need it), so pointing the
+    # engine at the /opt bundle directly still works on app 3.18.2+.
     if explicit.lower().endswith(".cjs"):
-        return _node_prefix(explicit)
+        return _node_prefix(str(_keyring_aware_cjs(Path(explicit), dry_run=False)))
     if explicit.lower().endswith(".py"):
         return [sys.executable, explicit]
     return [explicit]
@@ -219,9 +400,21 @@ def _zcode_failure_hint(stderr: str) -> str:
                 "once in a terminal first; if a fresh login still leaves this "
                 "error, the rejection is server-side (report to z.ai support "
                 "with the traceId): " + s)
-    if "Select a model before continuing" in s:
-        return ("zcode headless CLI has no usable account - run `zcode login` "
-                "once in a terminal (separate from the desktop app's login): " + s)
+    if "Select a model before continuing" in s or \
+            "Select a model before sending a message" in s:
+        # 0.16.9 said "before continuing"; 3.18.2's CLI says "before sending a
+        # message". The measured 3.18.2 cause: the standalone bundle cannot
+        # import @napi-rs/keyring, so the os-keyring-encrypted credentials
+        # stay locked, no account provider is provisioned and the default
+        # model selection cannot resolve (resolve_zcode_cmd's launch copy
+        # normally papers over this; ending here means the shim could not be
+        # built, or the login itself is stale).
+        return ("zcode headless CLI could not resolve a usable account/model - "
+                "run `zcode login` once in a terminal (separate from the "
+                "desktop app's login); if the login is fine (desktop app "
+                "works), the standalone CLI could not decrypt the "
+                "os-keyring-encrypted credentials to provision the account "
+                "provider (ZCode app 3.18.2+): " + s)
     if "Built-in Provider Config" in s:
         return ("zcode cannot locate its built-in provider catalog (the CLI's "
                 "path probe misses this install layout) - pass --zcode-cli "
